@@ -35,7 +35,7 @@ import {
 const DEFAULT_OPTS = {
   mode: "all",
   includeImages: true,
-  imageMode: "base64", // base64 | webdav | url
+  imageMode: "url", // url(L站链接) | base64 | webdav
   webdav: null,
   skipEmojiImg: true,
   includeMeta: true,
@@ -384,7 +384,8 @@ function buildMarkdown({
   }
 
   for (const p of posts) {
-    const label = `#${p.number} ${p.author}${p.createdAt ? ` · ${p.createdAt}` : ""}`;
+    // 不要写成 #### #1，否则 Obsidian 会显示多余的 #；楼层号用纯数字
+    const label = `${p.number} ${p.author}${p.createdAt ? ` · ${p.createdAt}` : ""}`.trim();
     // Obsidian：默认 #### 楼层；紧凑模式用加粗，不占大纲
     if (compactPostHeader) {
       lines.push(`**${label}**`, "");

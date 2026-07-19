@@ -59,11 +59,12 @@
     try {
       const defaults = {
         includeImages: true,
-        imageMode: "base64",
+        imageMode: "url",
         skipEmoji: true,
         includeMeta: true,
         mode: "all",
-        vaultPath: "",
+        enableNoteSync: false,
+        noteFolderName: "",
         askSaveAs: false,
         compactPostHeader: false,
         postHeadingLevel: 4,
@@ -80,11 +81,12 @@
     } catch {
       return {
         includeImages: true,
-        imageMode: "base64",
+        imageMode: "url",
         skipEmoji: true,
         includeMeta: true,
         mode: "all",
-        vaultPath: "",
+        enableNoteSync: false,
+        noteFolderName: "",
         askSaveAs: false,
         compactPostHeader: false,
         postHeadingLevel: 4,
@@ -106,7 +108,7 @@
       const settings = await loadSettings();
       const allowed = new Set(["all", "author", "op", "range"]);
       const mode = allowed.has(settings.mode) ? settings.mode : "all";
-      let imageMode = settings.imageMode || "base64";
+      let imageMode = settings.imageMode || "url";
       if (!settings.imageMode && settings.includeImages === false) imageMode = "url";
       const options = {
         mode,
@@ -128,11 +130,12 @@
         }
       );
 
+      // 页面浮动按钮：走下载 API（侧边栏可选文件夹写入）
       const dl = await chrome.runtime.sendMessage({
         type: "DOWNLOAD_MARKDOWN",
         filename: result.filename,
         content: result.markdown,
-        vaultPath: settings.vaultPath || "",
+        vaultPath: "",
         saveAs: !!settings.askSaveAs,
       });
       if (!dl?.ok) throw new Error(dl?.error || "下载失败");

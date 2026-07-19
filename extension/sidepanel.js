@@ -1,15 +1,25 @@
 import { parseTopicFromUrl } from "./lib/discourse.js";
 import { exportTopicMarkdown } from "./lib/export.js";
 import {
+  clearNoteDirectory,
+  getNoteDirectoryHandle,
+  pickNoteDirectory,
+  supportsDirectoryPicker,
+  writeMarkdownToDirectory,
+} from "./lib/folder-handle.js";
+import {
   ensureDir,
   joinRemotePath,
   listDirectories,
   normalizeBaseUrl,
   normalizeRemotePath,
   testConnection,
+  uploadTextFile,
 } from "./lib/webdav.js";
 
 const $ = (id) => document.getElementById(id);
+
+const JIANGUOYUN_DAV = "https://dav.jianguoyun.com/dav/";
 
 const ui = {
   pageStatus: $("pageStatus"),
@@ -26,27 +36,36 @@ const ui = {
   davUser: $("davUser"),
   davPass: $("davPass"),
   davRoot: $("davRoot"),
+  davRootDisplay: $("davRootDisplay"),
   davImagePath: $("davImagePath"),
-  davLinkStyle: $("davLinkStyle"),
-  davPublicUrl: $("davPublicUrl"),
-  davNotePrefix: $("davNotePrefix"),
-  publicUrlRow: $("publicUrlRow"),
+  davImagePathDisplay: $("davImagePathDisplay"),
+  webdavPathsCard: $("webdavPathsCard"),
   folderBrowser: $("folderBrowser"),
+  folderTargetLabel: $("folderTargetLabel"),
   folderCur: $("folderCur"),
   folderList: $("folderList"),
   newFolderName: $("newFolderName"),
-  btnBrowseDav: $("btnBrowseDav"),
+  btnBrowseRoot: $("btnBrowseRoot"),
+  btnBrowseImage: $("btnBrowseImage"),
   btnFolderUp: $("btnFolderUp"),
   btnFolderRefresh: $("btnFolderRefresh"),
+  btnFolderClose: $("btnFolderClose"),
   btnNewFolder: $("btnNewFolder"),
   btnUseFolder: $("btnUseFolder"),
   btnTestDav: $("btnTestDav"),
   btnTogglePwd: $("btnTogglePwd"),
   btnRefresh: $("btnRefresh"),
   davStatus: $("davStatus"),
-  vaultPath: $("vaultPath"),
+  enableDavNoteUpload: $("enableDavNoteUpload"),
+  davNotePathFields: $("davNotePathFields"),
+  davNoteOffHint: $("davNoteOffHint"),
+  enableNoteSync: $("enableNoteSync"),
+  noteSyncFields: $("noteSyncFields"),
+  noteSyncOffHint: $("noteSyncOffHint"),
+  noteFolderDisplay: $("noteFolderDisplay"),
+  btnBrowseNoteFolder: $("btnBrowseNoteFolder"),
+  btnClearNoteFolder: $("btnClearNoteFolder"),
   pathPreview: $("pathPreview"),
-  askSaveAs: $("askSaveAs"),
   skipEmoji: $("skipEmoji"),
   includeMeta: $("includeMeta"),
   compactPostHeader: $("compactPostHeader"),
@@ -68,36 +87,41 @@ const MODE_HINTS = {
 };
 
 const IMAGE_MODE_HINTS = {
-  base64: "默认：图片内嵌 base64，笔记可离线打开",
-  webdav: "图片上传到 WebDAV 文件夹，笔记里写文件链接（体积小）",
-  url: "不下载图片，笔记保留原 CDN 链接（需联网）",
+  url: "保留 L 站原图链接",
+  base64: "内嵌 base64",
+  webdav: "上传到图片路径",
 };
 
 const DEFAULT_SETTINGS = {
   includeImages: true,
-  imageMode: "base64",
+  imageMode: "url",
   skipEmoji: true,
   includeMeta: true,
   mode: "all",
-  vaultPath: "",
-  askSaveAs: false,
+  enableNoteSync: false, // 本地导出，默认关
+  enableDavNoteUpload: false, // 笔记上传 WebDAV，默认关
+  noteFolderName: "",
   compactPostHeader: false,
   postHeadingLevel: 4,
   webdav: {
-    baseUrl: "",
+    baseUrl: JIANGUOYUN_DAV,
     username: "",
     password: "",
-    rootPath: "/",
+    // notePath：笔记 md 上传目录（原 rootPath）
+    notePath: "/",
+    rootPath: "/", // 兼容旧字段
     imagePath: "/attachments",
     linkStyle: "relative",
-    publicBaseUrl: "",
-    noteRelativePrefix: "",
   },
 };
 
 let lastResult = null;
 let currentTab = null;
+/** @type {'root'|'image'|null} */
+let browseTarget = null;
 let browsePath = "/";
+/** @type {FileSystemDirectoryHandle|null} */
+let noteDirHandle = null;
 
 function showError(msg) {
   ui.err.hidden = !msg;
@@ -128,37 +152,73 @@ function modeValue() {
 
 function imageModeValue() {
   const el = document.querySelector('input[name="imageMode"]:checked');
-  return el ? el.value : "base64";
+  return el ? el.value : "url";
 }
 
-function sanitizeVaultSubpath(raw) {
-  let p = String(raw || "").trim();
-  if (!p) return "";
-  p = p.replace(/^[a-zA-Z]:[\\/]/, "");
-  p = p.replace(/^~[\\/]?/, "");
-  p = p.replace(/\\/g, "/");
-  p = p.replace(/^\/+/, "");
-  return p
-    .split("/")
-    .map((seg) => seg.trim())
-    .filter((seg) => seg && seg !== "." && seg !== "..")
-    .map((seg) => seg.replace(/[<>:"|?*\x00-\x1f]/g, "_"))
-    .join("/");
+function setDavPathDisplay(hiddenInput, displayEl, path, fallback = "/") {
+  const p = normalizeRemotePath(path || fallback);
+  if (hiddenInput) hiddenInput.value = p;
+  if (displayEl) {
+    displayEl.textContent = p;
+    displayEl.title = p;
+  }
+}
+
+function setNotePathDisplay(path) {
+  setDavPathDisplay(ui.davRoot, ui.davRootDisplay, path, "/");
+}
+
+function setImagePathDisplay(path) {
+  setDavPathDisplay(ui.davImagePath, ui.davImagePathDisplay, path, "/attachments");
+}
+
+function updateDavNoteUploadUi() {
+  const on = !!ui.enableDavNoteUpload?.checked;
+  if (ui.davNotePathFields) ui.davNotePathFields.hidden = !on;
+  if (ui.davNoteOffHint) ui.davNoteOffHint.hidden = on;
+}
+
+function updateNoteFolderDisplay(name) {
+  if (!ui.noteFolderDisplay) return;
+  if (name) {
+    ui.noteFolderDisplay.textContent = `📁 ${name}`;
+    ui.noteFolderDisplay.title = name;
+  } else {
+    ui.noteFolderDisplay.textContent = "未选择";
+    ui.noteFolderDisplay.title = "";
+  }
 }
 
 function updatePathPreview() {
   if (!ui.pathPreview) return;
-  if (ui.askSaveAs?.checked) {
-    ui.pathPreview.textContent = "将弹出「另存为」对话框";
+  if (!ui.enableNoteSync?.checked) {
+    ui.pathPreview.textContent = "";
     return;
   }
-  const sub = sanitizeVaultSubpath(ui.vaultPath?.value || "");
-  if (!sub) {
-    ui.pathPreview.textContent =
-      "保存到：浏览器默认下载目录（可在路径里填 vault 子文件夹）";
+  if (noteDirHandle?.name) {
+    ui.pathPreview.textContent = `已选：${noteDirHandle.name}`;
     return;
   }
-  ui.pathPreview.textContent = `保存到：下载目录 / ${sub}/文件名.md`;
+  ui.pathPreview.textContent = "";
+}
+
+function updateNoteSyncUi() {
+  const on = !!ui.enableNoteSync?.checked;
+  if (ui.noteSyncFields) ui.noteSyncFields.hidden = !on;
+  if (ui.noteSyncOffHint) ui.noteSyncOffHint.hidden = on;
+  updatePathPreview();
+}
+
+function updateImageModeUi() {
+  const mode = imageModeValue();
+  const isDav = mode === "webdav";
+  if (ui.imageModeHint) ui.imageModeHint.textContent = IMAGE_MODE_HINTS[mode] || "";
+  if (ui.webdavCard) ui.webdavCard.hidden = !isDav;
+  if (ui.webdavPathsCard) ui.webdavPathsCard.hidden = !isDav;
+  if (!isDav && ui.folderBrowser) {
+    ui.folderBrowser.hidden = true;
+    browseTarget = null;
+  }
 }
 
 function updateModeUi() {
@@ -167,42 +227,39 @@ function updateModeUi() {
   if (ui.modeHint) ui.modeHint.textContent = MODE_HINTS[mode] || "";
 }
 
-function updateImageModeUi() {
-  const mode = imageModeValue();
-  if (ui.imageModeHint) ui.imageModeHint.textContent = IMAGE_MODE_HINTS[mode] || "";
-  if (ui.webdavCard) ui.webdavCard.hidden = mode !== "webdav";
-  if (ui.publicUrlRow) {
-    ui.publicUrlRow.hidden = ui.davLinkStyle.value !== "public";
-  }
-}
-
 function readWebdavFromForm() {
+  const notePath = normalizeRemotePath(
+    ui.davRoot?.value || wNotePathFallback()
+  );
   return {
-    baseUrl: (ui.davUrl.value || "").trim(),
+    baseUrl: (ui.davUrl.value || "").trim() || JIANGUOYUN_DAV,
     username: (ui.davUser.value || "").trim(),
     password: ui.davPass.value || "",
-    rootPath: normalizeRemotePath(ui.davRoot.value || "/"),
-    imagePath: normalizeRemotePath(ui.davImagePath.value || "/attachments"),
-    linkStyle: ui.davLinkStyle.value || "relative",
-    publicBaseUrl: (ui.davPublicUrl.value || "").trim(),
-    noteRelativePrefix: (ui.davNotePrefix.value || "").trim().replace(/\\/g, "/"),
+    notePath,
+    // export 图片逻辑仍读 imagePath；rootPath 兼容旧代码
+    rootPath: notePath,
+    imagePath: normalizeRemotePath(ui.davImagePath?.value || "/attachments"),
+    linkStyle: "relative",
+    publicBaseUrl: "",
+    noteRelativePrefix: "",
   };
 }
 
+function wNotePathFallback() {
+  return "/";
+}
+
 function fillWebdavForm(w = {}) {
-  ui.davUrl.value = w.baseUrl || "";
+  ui.davUrl.value = w.baseUrl || JIANGUOYUN_DAV;
   ui.davUser.value = w.username || "";
   ui.davPass.value = w.password || "";
-  ui.davRoot.value = w.rootPath || "/";
-  ui.davImagePath.value = w.imagePath || "/attachments";
-  ui.davLinkStyle.value = w.linkStyle || "relative";
-  ui.davPublicUrl.value = w.publicBaseUrl || "";
-  ui.davNotePrefix.value = w.noteRelativePrefix || "";
+  // 兼容旧 rootPath
+  setNotePathDisplay(w.notePath || w.rootPath || "/");
+  setImagePathDisplay(w.imagePath || "/attachments");
 }
 
 function loadSettings() {
   return chrome.storage.local.get(DEFAULT_SETTINGS).then(async (local) => {
-    // 兼容旧 sync 设置
     const sync = await chrome.storage.sync.get(DEFAULT_SETTINGS).catch(() => ({}));
     return {
       ...DEFAULT_SETTINGS,
@@ -225,15 +282,14 @@ async function saveSettings() {
     skipEmoji: ui.skipEmoji.checked,
     includeMeta: ui.includeMeta.checked,
     mode: modeValue(),
-    vaultPath: sanitizeVaultSubpath(ui.vaultPath.value),
-    askSaveAs: !!ui.askSaveAs.checked,
+    enableNoteSync: !!ui.enableNoteSync.checked,
+    enableDavNoteUpload: !!ui.enableDavNoteUpload?.checked,
+    noteFolderName: noteDirHandle?.name || "",
     compactPostHeader: !!ui.compactPostHeader.checked,
     postHeadingLevel: Number(ui.postHeadingLevel.value) || 4,
     webdav: readWebdavFromForm(),
   };
-  // 敏感信息放 local，避免 sync 配额/同步
   await chrome.storage.local.set(data);
-  // 非敏感同步一份（不含密码）
   const { password, ...webdavPublic } = data.webdav;
   await chrome.storage.sync.set({
     ...data,
@@ -241,19 +297,21 @@ async function saveSettings() {
   });
   updatePathPreview();
   updateImageModeUi();
+  updateNoteSyncUi();
+  updateDavNoteUploadUi();
 }
 
 function setDavStatus(text, type = "") {
+  if (!ui.davStatus) return;
   ui.davStatus.textContent = text || "";
   ui.davStatus.className = "dav-status" + (type ? " " + type : "");
 }
 
 async function ensureWebdavPermission(baseUrl) {
-  const base = normalizeBaseUrl(baseUrl);
+  const base = normalizeBaseUrl(baseUrl || JIANGUOYUN_DAV);
   if (!base) throw new Error("请填写服务器地址");
   const origin = new URL(base).origin;
   const patterns = [`${origin}/*`];
-  // 必须在 popup 用户手势下 request，SW 里常被拒绝
   try {
     const has = await chrome.permissions.contains({ origins: patterns });
     if (has) return true;
@@ -263,7 +321,6 @@ async function ensureWebdavPermission(baseUrl) {
     }
     return true;
   } catch (e) {
-    // 兼容：走 background
     const res = await chrome.runtime.sendMessage({
       type: "ENSURE_WEBDAV_HOST",
       origin,
@@ -280,8 +337,10 @@ async function testDav() {
   try {
     const cfg = readWebdavFromForm();
     await ensureWebdavPermission(cfg.baseUrl);
-    await testConnection(cfg);
-    // 确保图片目录
+    await testConnection({ ...cfg, rootPath: "/" });
+    if (ui.enableDavNoteUpload?.checked && cfg.notePath && cfg.notePath !== "/") {
+      await ensureDir(cfg, cfg.notePath);
+    }
     if (cfg.imagePath) await ensureDir(cfg, cfg.imagePath);
     setDavStatus("连接成功", "ok");
     await saveSettings();
@@ -290,12 +349,25 @@ async function testDav() {
   }
 }
 
-async function openFolderBrowser() {
+/**
+ * @param {'root'|'image'} target
+ */
+async function openDavFolderBrowser(target) {
+  browseTarget = target;
   ui.folderBrowser.hidden = false;
-  const root = normalizeRemotePath(ui.davRoot.value || "/");
-  const current = normalizeRemotePath(ui.davImagePath.value || root);
-  browsePath = current || root || "/";
+  if (ui.folderTargetLabel) {
+    ui.folderTargetLabel.textContent =
+      target === "root" ? "选择：笔记上传目录" : "选择：图片上传目录";
+  }
+  const notePath = normalizeRemotePath(ui.davRoot?.value || "/");
+  const image = normalizeRemotePath(ui.davImagePath?.value || notePath);
+  browsePath = target === "root" ? notePath || "/" : image || "/";
   await refreshFolderList();
+}
+
+function closeFolderBrowser() {
+  if (ui.folderBrowser) ui.folderBrowser.hidden = true;
+  browseTarget = null;
 }
 
 async function refreshFolderList() {
@@ -305,16 +377,28 @@ async function refreshFolderList() {
     const cfg = readWebdavFromForm();
     await ensureWebdavPermission(cfg.baseUrl);
     const dirs = await listDirectories(cfg, browsePath);
+    ui.folderList.innerHTML = "";
+
+    const head = document.createElement("div");
+    head.className = "folder-empty";
+    head.style.textAlign = "left";
+    head.innerHTML = `当前：<code>${escapeHtml(browsePath)}</code> · 子文件夹 ${dirs.length} 个`;
+    ui.folderList.appendChild(head);
+
     if (!dirs.length) {
-      ui.folderList.innerHTML = `<div class="folder-empty">此目录下没有子文件夹</div>`;
+      const empty = document.createElement("div");
+      empty.className = "folder-empty";
+      empty.textContent = "无子文件夹，可直接选中当前目录";
+      ui.folderList.appendChild(empty);
       return;
     }
-    ui.folderList.innerHTML = "";
+
     for (const d of dirs) {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "folder-item";
       btn.innerHTML = `<span class="ico">📁</span><span>${escapeHtml(d.name)}</span>`;
+      btn.title = d.path;
       btn.addEventListener("click", async () => {
         browsePath = d.path;
         await refreshFolderList();
@@ -322,6 +406,7 @@ async function refreshFolderList() {
       ui.folderList.appendChild(btn);
     }
   } catch (e) {
+    console.error("[L2MD] list dir", e);
     ui.folderList.innerHTML = `<div class="folder-empty">${escapeHtml(e?.message || String(e))}</div>`;
   }
 }
@@ -335,12 +420,10 @@ function escapeHtml(s) {
 }
 
 async function folderUp() {
-  const root = normalizeRemotePath(ui.davRoot.value || "/");
-  if (browsePath === "/" || browsePath === root) return;
+  if (browsePath === "/") return;
   const parts = browsePath.split("/").filter(Boolean);
   parts.pop();
   browsePath = parts.length ? "/" + parts.join("/") : "/";
-  // 不允许高于 root？允许浏览，但提示
   await refreshFolderList();
 }
 
@@ -365,10 +448,51 @@ async function createFolder() {
 }
 
 function useCurrentFolder() {
-  ui.davImagePath.value = normalizeRemotePath(browsePath);
-  ui.folderBrowser.hidden = true;
-  setDavStatus(`图片目录：${ui.davImagePath.value}`, "ok");
+  const path = normalizeRemotePath(browsePath || "/");
+  if (browseTarget === "root") {
+    setNotePathDisplay(path);
+    setDavStatus(`笔记上传目录：${path}`, "ok");
+  } else {
+    setImagePathDisplay(path);
+    setDavStatus(`图片上传目录：${path}`, "ok");
+  }
+  closeFolderBrowser();
   saveSettings();
+}
+
+async function refreshNoteFolderFromStore() {
+  noteDirHandle = await getNoteDirectoryHandle();
+  updateNoteFolderDisplay(noteDirHandle?.name || "");
+  updatePathPreview();
+  if (noteDirHandle?.name) {
+    await chrome.storage.local.set({ noteFolderName: noteDirHandle.name });
+  }
+}
+
+async function onBrowseNoteFolder() {
+  try {
+    const { handle, name } = await pickNoteDirectory();
+    noteDirHandle = handle;
+    updateNoteFolderDisplay(name);
+    await chrome.storage.local.set({ noteFolderName: name, enableNoteSync: true });
+    if (ui.enableNoteSync) ui.enableNoteSync.checked = true;
+    updateNoteSyncUi();
+    ui.hint.textContent = `本地保存：${name}`;
+    await saveSettings();
+  } catch (e) {
+    if (e?.name === "AbortError") return;
+    showError(e?.message || String(e));
+  }
+}
+
+async function onClearNoteFolder() {
+  await clearNoteDirectory();
+  noteDirHandle = null;
+  updateNoteFolderDisplay("");
+  await chrome.storage.local.set({ noteFolderName: "" });
+  updatePathPreview();
+  await saveSettings();
+  ui.hint.textContent = "已清除本地保存路径";
 }
 
 function bindUi() {
@@ -389,36 +513,27 @@ function bindUi() {
     ui.skipEmoji,
     ui.includeMeta,
     ui.compactPostHeader,
-    ui.askSaveAs,
     ui.postHeadingLevel,
-    ui.davLinkStyle,
+    ui.enableNoteSync,
+    ui.enableDavNoteUpload,
   ].forEach((el) => el?.addEventListener("change", saveSettings));
 
-  ui.davLinkStyle?.addEventListener("change", updateImageModeUi);
+  ui.enableNoteSync?.addEventListener("change", updateNoteSyncUi);
+  ui.enableDavNoteUpload?.addEventListener("change", updateDavNoteUploadUi);
 
-  [
-    ui.davUrl,
-    ui.davUser,
-    ui.davPass,
-    ui.davRoot,
-    ui.davImagePath,
-    ui.davPublicUrl,
-    ui.davNotePrefix,
-    ui.vaultPath,
-  ].forEach((el) => {
+  [ui.davUrl, ui.davUser, ui.davPass].forEach((el) => {
     el?.addEventListener("change", saveSettings);
   });
 
-  ui.vaultPath?.addEventListener("input", updatePathPreview);
-  ui.vaultPath?.addEventListener("blur", () => {
-    ui.vaultPath.value = sanitizeVaultSubpath(ui.vaultPath.value);
-    saveSettings();
-  });
+  ui.btnBrowseNoteFolder?.addEventListener("click", onBrowseNoteFolder);
+  ui.btnClearNoteFolder?.addEventListener("click", onClearNoteFolder);
 
   ui.btnTestDav?.addEventListener("click", testDav);
-  ui.btnBrowseDav?.addEventListener("click", openFolderBrowser);
+  ui.btnBrowseRoot?.addEventListener("click", () => openDavFolderBrowser("root"));
+  ui.btnBrowseImage?.addEventListener("click", () => openDavFolderBrowser("image"));
   ui.btnFolderUp?.addEventListener("click", folderUp);
   ui.btnFolderRefresh?.addEventListener("click", refreshFolderList);
+  ui.btnFolderClose?.addEventListener("click", closeFolderBrowser);
   ui.btnNewFolder?.addEventListener("click", createFolder);
   ui.btnUseFolder?.addEventListener("click", useCurrentFolder);
   ui.btnTogglePwd?.addEventListener("click", () => {
@@ -534,30 +649,75 @@ async function doExport() {
       onExportProgress
     );
 
-    const vaultPath = sanitizeVaultSubpath(ui.vaultPath.value);
-    const askSaveAs = !!ui.askSaveAs.checked;
+    // 1) 本地导出（默认关 → 下载目录）
+    const enableNoteSync = !!ui.enableNoteSync.checked;
+    const parts = [];
 
-    const dl = await chrome.runtime.sendMessage({
-      type: "DOWNLOAD_MARKDOWN",
-      filename: result.filename,
-      content: result.markdown,
-      vaultPath,
-      saveAs: askSaveAs,
-    });
-    if (!dl?.ok) throw new Error(dl?.error || "下载失败");
+    if (enableNoteSync) {
+      if (!noteDirHandle) noteDirHandle = await getNoteDirectoryHandle();
+      if (noteDirHandle) {
+        const savedName = await writeMarkdownToDirectory(
+          noteDirHandle,
+          result.filename,
+          result.markdown
+        );
+        parts.push(`本地 ${noteDirHandle.name}/`);
+        result.filename = savedName;
+      } else if (supportsDirectoryPicker()) {
+        const picked = await pickNoteDirectory();
+        noteDirHandle = picked.handle;
+        updateNoteFolderDisplay(picked.name);
+        const savedName = await writeMarkdownToDirectory(
+          noteDirHandle,
+          result.filename,
+          result.markdown
+        );
+        parts.push(`本地 ${picked.name}/`);
+        result.filename = savedName;
+        await chrome.storage.local.set({ noteFolderName: picked.name });
+      } else {
+        const dl = await chrome.runtime.sendMessage({
+          type: "DOWNLOAD_MARKDOWN",
+          filename: result.filename,
+          content: result.markdown,
+          vaultPath: "",
+          saveAs: false,
+        });
+        if (!dl?.ok) throw new Error(dl?.error || "下载失败");
+        parts.push("下载目录");
+      }
+    } else {
+      const dl = await chrome.runtime.sendMessage({
+        type: "DOWNLOAD_MARKDOWN",
+        filename: result.filename,
+        content: result.markdown,
+        vaultPath: "",
+        saveAs: false,
+      });
+      if (!dl?.ok) throw new Error(dl?.error || "下载失败");
+      parts.push("下载目录");
+    }
+
+    // 2) 笔记上传 WebDAV（默认关）
+    const uploadNoteDav =
+      imageMode === "webdav" && !!ui.enableDavNoteUpload?.checked;
+    if (uploadNoteDav) {
+      setProgress(96, "上传笔记到 WebDAV…");
+      const noteDir = normalizeRemotePath(webdav.notePath || webdav.rootPath || "/");
+      const remoteMd = joinRemotePath(noteDir, result.filename);
+      await uploadTextFile(webdav, remoteMd, result.markdown);
+      parts.push(`WebDAV ${noteDir}/`);
+    }
 
     lastResult = result;
     const imgInfo =
       result.imageMode === "webdav"
-        ? `WebDAV 上传 ${result.webdavUploaded || result.imageCount}`
-        : `图片 ${result.imageCount}`;
+        ? `图 ${result.webdavUploaded || result.imageCount}`
+        : result.imageMode === "url"
+          ? "L站链接"
+          : `图 ${result.imageCount}`;
     setProgress(100, `完成：${result.postCount} 层，${imgInfo}`);
-    const where = askSaveAs
-      ? "已弹出另存为"
-      : vaultPath
-        ? `已保存到 下载/${vaultPath}/`
-        : "已保存到下载目录";
-    ui.hint.textContent = `${where}${result.filename}`;
+    ui.hint.textContent = `已保存：${parts.join(" · ")}${result.filename}`;
     ui.btnCopy.disabled = false;
   } catch (e) {
     console.error(e);
@@ -591,8 +751,10 @@ async function main() {
   ui.skipEmoji.checked = !!settings.skipEmoji;
   ui.includeMeta.checked = !!settings.includeMeta;
   ui.compactPostHeader.checked = !!settings.compactPostHeader;
-  ui.askSaveAs.checked = !!settings.askSaveAs;
-  ui.vaultPath.value = settings.vaultPath || "";
+  ui.enableNoteSync.checked = !!settings.enableNoteSync;
+  if (ui.enableDavNoteUpload) {
+    ui.enableDavNoteUpload.checked = !!settings.enableDavNoteUpload;
+  }
   ui.postHeadingLevel.value = String(settings.postHeadingLevel || 4);
 
   const allowedModes = new Set(["all", "author", "op", "range"]);
@@ -600,27 +762,41 @@ async function main() {
   const modeEl = document.querySelector(`input[name="mode"][value="${mode}"]`);
   if (modeEl) modeEl.checked = true;
 
-  let imageMode = settings.imageMode || "base64";
-  // 兼容旧 includeImages
+  let imageMode = settings.imageMode || "url";
   if (!settings.imageMode && settings.includeImages === false) imageMode = "url";
   const imgEl = document.querySelector(`input[name="imageMode"][value="${imageMode}"]`);
   if (imgEl) imgEl.checked = true;
+  else {
+    const urlEl = document.querySelector('input[name="imageMode"][value="url"]');
+    if (urlEl) urlEl.checked = true;
+  }
 
-  fillWebdavForm(settings.webdav || {});
+  fillWebdavForm({
+    ...DEFAULT_SETTINGS.webdav,
+    ...(settings.webdav || {}),
+    baseUrl: settings.webdav?.baseUrl || JIANGUOYUN_DAV,
+  });
+
+  await refreshNoteFolderFromStore();
+  if (!noteDirHandle && settings.noteFolderName) {
+    updateNoteFolderDisplay(settings.noteFolderName + "（需重新选择）");
+  }
+
   updateModeUi();
   updateImageModeUi();
+  updateNoteSyncUi();
+  updateDavNoteUploadUi();
   updatePathPreview();
 
   ui.btnExport.addEventListener("click", doExport);
   ui.btnCopy.addEventListener("click", copyMd);
   ui.btnRefresh?.addEventListener("click", () => detectPage());
 
-  // 侧边栏常开：切换标签 / 当前页 URL 变化时自动刷新主题信息
   try {
     chrome.tabs.onActivated.addListener(() => {
       detectPage().catch(() => {});
     });
-    chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+    chrome.tabs.onUpdated.addListener((_tabId, info, tab) => {
       if (info.status === "complete" || info.url) {
         if (tab?.active) detectPage().catch(() => {});
       }

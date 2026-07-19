@@ -29,16 +29,26 @@ export function joinRemotePath(...parts) {
   return "/" + segs.join("/");
 }
 
-export function encodePath(path) {
-  return normalizeRemotePath(path)
+/** 编码路径；dirSlash=true 时目录强制带尾部 /（PROPFIND 需要） */
+export function encodePath(path, { dirSlash = false } = {}) {
+  const norm = normalizeRemotePath(path);
+  if (norm === "/") return "/";
+  const encoded = norm
     .split("/")
     .map((seg) => (seg ? encodeURIComponent(seg) : ""))
     .join("/");
+  return dirSlash ? encoded + "/" : encoded;
 }
 
 export function authHeader(username, password) {
-  const token = btoa(unescape(encodeURIComponent(`${username}:${password}`)));
-  return `Basic ${token}`;
+  // 支持中文用户名
+  const raw = `${username}:${password || ""}`;
+  const bytes = new TextEncoder().encode(raw);
+  let binary = "";
+  bytes.forEach((b) => {
+    binary += String.fromCharCode(b);
+  });
+  return `Basic ${btoa(binary)}`;
 }
 
 function canUseBackground() {
@@ -49,12 +59,15 @@ function canUseBackground() {
   }
 }
 
-async function davRequest(cfg, { method, path, headers = {}, body, bodyBase64, contentType }) {
+async function davRequest(
+  cfg,
+  { method, path, headers = {}, body, bodyBase64, contentType, dirSlash = false }
+) {
   const base = normalizeBaseUrl(cfg.baseUrl);
   if (!base) throw new Error("请填写 WebDAV 服务器地址");
   if (!cfg.username) throw new Error("请填写 WebDAV 用户名");
 
-  const remotePath = encodePath(path || "/");
+  const remotePath = encodePath(path || "/", { dirSlash });
   const url = base + remotePath;
 
   const reqHeaders = {
@@ -71,13 +84,11 @@ async function davRequest(cfg, { method, path, headers = {}, body, bodyBase64, c
       headers: reqHeaders,
       bodyBase64: bodyBase64 || null,
       bodyText: typeof body === "string" ? body : null,
-      returnType: "meta", // status + text/base64
     });
     if (!res?.ok) throw new Error(res?.error || "WebDAV 请求失败");
-    return res.data;
+    return { ...res.data, url };
   }
 
-  // 降级：直接 fetch（popup 同源策略下通常仍会失败，仅调试用）
   const init = { method: method || "GET", headers: reqHeaders };
   if (bodyBase64) {
     const bin = atob(bodyBase64);
@@ -94,123 +105,270 @@ async function davRequest(cfg, { method, path, headers = {}, body, bodyBase64, c
     ok: res.ok || res.status === 201 || res.status === 204 || res.status === 207,
     text,
     contentType: res.headers.get("content-type") || "",
+    url,
   };
 }
 
-/** 测试连接：PROPFIND 根或指定目录 */
+/** 测试连接 */
 export async function testConnection(cfg) {
   const path = normalizeRemotePath(cfg.rootPath || "/");
   const res = await davRequest(cfg, {
     method: "PROPFIND",
     path,
+    dirSlash: true,
     headers: { Depth: "0" },
-    body: `<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:displayname/></d:prop></d:propfind>`,
+    body: `<?xml version="1.0" encoding="utf-8" ?>
+<propfind xmlns="DAV:">
+  <prop><resourcetype/><displayname/></prop>
+</propfind>`,
     contentType: "application/xml; charset=utf-8",
   });
   if (!(res.ok || res.status === 207)) {
-    throw new Error(`连接失败 HTTP ${res.status}${res.text ? ": " + res.text.slice(0, 120) : ""}`);
+    throw new Error(
+      `连接失败 HTTP ${res.status}${res.text ? ": " + res.text.slice(0, 160) : ""}`
+    );
   }
   return true;
 }
 
 /**
- * 列出目录下的子文件夹
+ * 列出目录下的子文件夹（坚果云兼容）
  * @returns {Promise<{name:string, path:string}[]>}
  */
 export async function listDirectories(cfg, path = "/") {
   const dir = normalizeRemotePath(path);
-  const res = await davRequest(cfg, {
+
+  // 坚果云：目录 PROPFIND 建议 URL 带尾部 /
+  let res = await davRequest(cfg, {
     method: "PROPFIND",
     path: dir,
+    dirSlash: true,
     headers: { Depth: "1" },
-    body: `<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:">
-  <d:prop>
-    <d:resourcetype/>
-    <d:displayname/>
-    <d:getcontentlength/>
-  </d:prop>
-</d:propfind>`,
+    body: `<?xml version="1.0" encoding="utf-8" ?>
+<propfind xmlns="DAV:">
+  <prop>
+    <resourcetype/>
+    <displayname/>
+    <getcontenttype/>
+    <getcontentlength/>
+  </prop>
+</propfind>`,
     contentType: "application/xml; charset=utf-8",
   });
 
+  // 部分服务不接受 propfind 体，改 allprop
   if (!(res.ok || res.status === 207)) {
-    throw new Error(`列出目录失败 HTTP ${res.status}`);
+    res = await davRequest(cfg, {
+      method: "PROPFIND",
+      path: dir,
+      dirSlash: true,
+      headers: { Depth: "1" },
+      body: `<?xml version="1.0" encoding="utf-8" ?>
+<propfind xmlns="DAV:"><allprop/></propfind>`,
+      contentType: "application/xml; charset=utf-8",
+    });
   }
 
-  return parsePropfindDirectories(res.text || "", dir, normalizeBaseUrl(cfg.baseUrl));
+  if (!(res.ok || res.status === 207)) {
+    const hint = (res.text || "").replace(/\s+/g, " ").slice(0, 180);
+    throw new Error(`列出目录失败 HTTP ${res.status}${hint ? " · " + hint : ""}`);
+  }
+
+  const xml = res.text || "";
+  let dirs = parsePropfindDirectories(xml, dir, normalizeBaseUrl(cfg.baseUrl));
+
+  // 再兜底：纯正则扫 href
+  if (!dirs.length) {
+    dirs = parseDirectoriesByHrefRegex(xml, dir, normalizeBaseUrl(cfg.baseUrl));
+  }
+
+  return dirs;
+}
+
+function localName(el) {
+  if (!el) return "";
+  return (el.localName || el.nodeName || "").replace(/^.*:/, "").toLowerCase();
+}
+
+function findChildByLocal(parent, name) {
+  if (!parent?.children) return null;
+  const want = name.toLowerCase();
+  for (const c of parent.children) {
+    if (localName(c) === want) return c;
+  }
+  return null;
+}
+
+function findDescByLocal(root, name) {
+  if (!root) return null;
+  const want = name.toLowerCase();
+  const all = root.getElementsByTagName("*");
+  for (const el of all) {
+    if (localName(el) === want) return el;
+  }
+  return null;
+}
+
+function hasCollection(respEl) {
+  // <resourcetype><collection/></resourcetype>
+  const rt = findDescByLocal(respEl, "resourcetype");
+  if (!rt) return false;
+  if (findDescByLocal(rt, "collection")) return true;
+  // 有的实现把 collection 写成属性/空标签文本
+  const t = (rt.textContent || "").toLowerCase();
+  return t.includes("collection");
+}
+
+function hrefToRemotePath(href, baseUrl) {
+  let raw = String(href || "").trim();
+  if (!raw) return null;
+
+  // 去掉查询串
+  raw = raw.split("?")[0];
+
+  let path;
+  try {
+    if (/^https?:\/\//i.test(raw)) {
+      path = decodeURIComponent(new URL(raw).pathname);
+    } else {
+      path = decodeURIComponent(raw);
+    }
+  } catch {
+    try {
+      path = decodeURIComponent(raw);
+    } catch {
+      path = raw;
+    }
+  }
+
+  // 去掉 baseUrl 的 pathname 前缀，如 /dav
+  try {
+    const base = new URL(baseUrl);
+    let basePath = base.pathname || "";
+    if (basePath.length > 1 && basePath.endsWith("/")) {
+      basePath = basePath.slice(0, -1);
+    }
+    if (basePath && basePath !== "/" && path.startsWith(basePath + "/")) {
+      path = path.slice(basePath.length) || "/";
+    } else if (basePath && basePath !== "/" && path === basePath) {
+      path = "/";
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 再兜底去掉常见前缀 /dav
+  if (path === "/dav" || path.startsWith("/dav/")) {
+    path = path.slice(4) || "/";
+  }
+
+  return normalizeRemotePath(path);
+}
+
+function isImmediateChild(parentPath, childPath) {
+  const p = normalizeRemotePath(parentPath);
+  const c = normalizeRemotePath(childPath);
+  if (c === p) return false;
+  if (p === "/") {
+    // 一级：/foo
+    return c.split("/").filter(Boolean).length === 1;
+  }
+  if (!c.startsWith(p + "/")) return false;
+  const rest = c.slice(p.length + 1);
+  // 只要直接子级，不要孙子
+  return rest.length > 0 && !rest.includes("/");
 }
 
 function parsePropfindDirectories(xmlText, currentPath, baseUrl) {
+  if (!xmlText || !xmlText.trim()) return [];
+
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlText, "application/xml");
-  const responses = [
-    ...doc.getElementsByTagNameNS("DAV:", "response"),
-    ...doc.getElementsByTagName("d:response"),
-    ...doc.getElementsByTagName("D:response"),
-    ...doc.getElementsByTagName("response"),
-  ];
 
-  // 去重
+  // 解析错误时走正则
+  const parseErr = doc.querySelector("parsererror");
+  if (parseErr) {
+    return parseDirectoriesByHrefRegex(xmlText, currentPath, baseUrl);
+  }
+
+  const responses = [];
+  for (const el of doc.getElementsByTagName("*")) {
+    if (localName(el) === "response") responses.push(el);
+  }
+
   const seen = new Set();
   const dirs = [];
+  const cur = normalizeRemotePath(currentPath);
 
   for (const resp of responses) {
-    const hrefEl =
-      resp.getElementsByTagNameNS("DAV:", "href")[0] ||
-      resp.getElementsByTagName("d:href")[0] ||
-      resp.getElementsByTagName("D:href")[0] ||
-      resp.getElementsByTagName("href")[0];
-    if (!hrefEl) continue;
-
-    let href = (hrefEl.textContent || "").trim();
+    let href = "";
+    const hrefEl = findDescByLocal(resp, "href");
+    if (hrefEl) href = (hrefEl.textContent || "").trim();
     if (!href) continue;
 
-    // href 可能是绝对 URL 或 /dav/xxx
-    let path;
-    try {
-      if (/^https?:\/\//i.test(href)) {
-        const u = new URL(href);
-        const base = new URL(baseUrl);
-        path = decodeURIComponent(u.pathname);
-        // 去掉 base path 前缀（如 /dav）
-        if (base.pathname && base.pathname !== "/" && path.startsWith(base.pathname)) {
-          path = path.slice(base.pathname.length) || "/";
-        }
-      } else {
-        path = decodeURIComponent(href);
-        try {
-          const base = new URL(baseUrl);
-          if (base.pathname && base.pathname !== "/" && path.startsWith(base.pathname)) {
-            path = path.slice(base.pathname.length) || "/";
-          }
-        } catch {
-          /* ignore */
-        }
+    const path = hrefToRemotePath(href, baseUrl);
+    if (!path) continue;
+
+    // 目录判定：collection 或 href 以 / 结尾
+    const hrefLooksDir = /\/$/.test(href.split("?")[0]);
+    const collection = hasCollection(resp);
+    // 内容类型
+    const ctypeEl = findDescByLocal(resp, "getcontenttype");
+    const ctype = (ctypeEl?.textContent || "").toLowerCase();
+    const isDirType =
+      ctype.includes("directory") || ctype.includes("folder") || ctype === "httpd/unix-directory";
+
+    // 有 contentlength 且非 0、且不像目录 → 文件
+    const lenEl = findDescByLocal(resp, "getcontentlength");
+    const len = lenEl ? parseInt((lenEl.textContent || "").trim(), 10) : NaN;
+
+    let isDir = collection || hrefLooksDir || isDirType;
+    // 若完全看不出，且路径没有文件扩展名，当作目录候选（仅直接子级）
+    if (!isDir && !Number.isFinite(len)) {
+      const last = path.split("/").filter(Boolean).pop() || "";
+      if (last && !/\.[a-z0-9]{1,6}$/i.test(last)) {
+        // 保守：不自动当目录，避免把文件当文件夹
       }
-    } catch {
-      path = decodeURIComponent(href);
     }
 
-    path = normalizeRemotePath(path);
-
-    const isCollection =
-      resp.getElementsByTagNameNS("DAV:", "collection").length > 0 ||
-      resp.getElementsByTagName("d:collection").length > 0 ||
-      resp.getElementsByTagName("D:collection").length > 0 ||
-      resp.getElementsByTagName("collection").length > 0;
-
-    if (!isCollection) continue;
-    if (path === normalizeRemotePath(currentPath)) continue; // 自身
+    if (!isDir) continue;
+    if (path === cur) continue;
+    if (!isImmediateChild(cur, path)) continue;
     if (seen.has(path)) continue;
     seen.add(path);
 
-    const name =
-      path.split("/").filter(Boolean).pop() || path;
+    const nameEl = findDescByLocal(resp, "displayname");
+    let name = (nameEl?.textContent || "").trim();
+    if (!name) name = path.split("/").filter(Boolean).pop() || path;
+    // 去掉 displayname 里的路径噪声
+    name = name.replace(/\/+$/, "").split("/").pop() || name;
+
     dirs.push({ name, path });
   }
 
+  dirs.sort((a, b) => a.name.localeCompare(b.name, "zh"));
+  return dirs;
+}
+
+/** 正则兜底：从 multistatus 抽所有 href，尾部 / 的视为目录 */
+function parseDirectoriesByHrefRegex(xmlText, currentPath, baseUrl) {
+  const cur = normalizeRemotePath(currentPath);
+  const seen = new Set();
+  const dirs = [];
+  const re = /<[^:>]*:?href[^>]*>([^<]+)<\/[^:>]*:?href>/gi;
+  let m;
+  while ((m = re.exec(xmlText)) !== null) {
+    const href = m[1].trim();
+    const path = hrefToRemotePath(href, baseUrl);
+    if (!path || path === cur) continue;
+    const looksDir = /\/\s*$/.test(href) || /\/$/.test(href.split("?")[0]);
+    if (!looksDir) continue;
+    if (!isImmediateChild(cur, path)) continue;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const name = path.split("/").filter(Boolean).pop() || path;
+    dirs.push({ name, path });
+  }
   dirs.sort((a, b) => a.name.localeCompare(b.name, "zh"));
   return dirs;
 }
@@ -227,36 +385,30 @@ export async function ensureDir(cfg, path) {
     const res = await davRequest(cfg, {
       method: "MKCOL",
       path: cur,
+      dirSlash: true,
     });
-    // 201 created, 405/409 already exists — 都可接受
     if (
       res.status === 201 ||
       res.status === 405 ||
       res.status === 409 ||
       res.status === 301 ||
       res.status === 200 ||
+      res.status === 403 ||
       res.ok
     ) {
       continue;
     }
-    // 有的服务器对已存在返回 403/405
-    if (res.status === 403) continue;
     throw new Error(`创建目录失败 ${cur} HTTP ${res.status}`);
   }
 }
 
 /**
  * 上传二进制文件
- * @param {object} cfg
- * @param {string} remotePath 完整远程路径含文件名
- * @param {ArrayBuffer|Uint8Array} data
- * @param {string} contentType
  */
 export async function uploadFile(cfg, remotePath, data, contentType = "application/octet-stream") {
   const bytes =
     data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data);
 
-  // base64
   let binary = "";
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {
@@ -264,13 +416,13 @@ export async function uploadFile(cfg, remotePath, data, contentType = "applicati
   }
   const bodyBase64 = btoa(binary);
 
-  // 确保父目录
   const parent = normalizeRemotePath(remotePath.split("/").slice(0, -1).join("/") || "/");
   await ensureDir(cfg, parent);
 
   const res = await davRequest(cfg, {
     method: "PUT",
     path: remotePath,
+    dirSlash: false,
     bodyBase64,
     contentType,
   });
@@ -281,11 +433,19 @@ export async function uploadFile(cfg, remotePath, data, contentType = "applicati
   return true;
 }
 
-/**
- * 生成 Markdown 中使用的图片链接
- */
+/** 上传 UTF-8 文本（如 .md 笔记） */
+export async function uploadTextFile(
+  cfg,
+  remotePath,
+  text,
+  contentType = "text/markdown; charset=utf-8"
+) {
+  const bytes = new TextEncoder().encode(String(text ?? ""));
+  return uploadFile(cfg, remotePath, bytes, contentType);
+}
+
 export function buildImageMarkdownSrc(cfg, remoteFilePath, filename) {
-  const linkStyle = cfg.linkStyle || "relative"; // relative | absolute | public
+  const linkStyle = cfg.linkStyle || "relative";
   const path = normalizeRemotePath(remoteFilePath);
 
   if (linkStyle === "absolute") {
@@ -294,7 +454,6 @@ export function buildImageMarkdownSrc(cfg, remoteFilePath, filename) {
 
   if (linkStyle === "public" && cfg.publicBaseUrl) {
     const pub = normalizeBaseUrl(cfg.publicBaseUrl);
-    // publicBaseUrl 对应 rootPath 的公开映射
     const root = normalizeRemotePath(cfg.rootPath || "/");
     let rel = path;
     if (root !== "/" && path.startsWith(root)) {
@@ -303,16 +462,13 @@ export function buildImageMarkdownSrc(cfg, remoteFilePath, filename) {
     return pub + encodePath(rel);
   }
 
-  // relative：相对笔记的路径（推荐 Obsidian + 同步盘）
-  // 若配置了 noteRelativePrefix 则用它，否则用文件名所在目录名/文件名
   if (cfg.noteRelativePrefix) {
     const prefix = String(cfg.noteRelativePrefix).replace(/\\/g, "/").replace(/\/+$/, "");
     return `${prefix}/${filename}`.replace(/\/{2,}/g, "/");
   }
 
-  // 默认：attachments/xxx.png 或 用户文件夹名/xxx.png
   const folder = path.split("/").filter(Boolean);
-  folder.pop(); // remove filename
+  folder.pop();
   const lastFolder = folder[folder.length - 1] || "attachments";
   return `${lastFolder}/${filename}`;
 }
@@ -330,14 +486,12 @@ export function guessExtFromMime(mime, fallbackUrl = "") {
 }
 
 export async function sha1Short(buffer) {
-  const data =
-    buffer instanceof ArrayBuffer ? buffer : buffer.buffer || buffer;
+  const data = buffer instanceof ArrayBuffer ? buffer : buffer.buffer || buffer;
   if (crypto?.subtle) {
     const hash = await crypto.subtle.digest("SHA-1", data);
     const arr = [...new Uint8Array(hash)];
     return arr.map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 12);
   }
-  // 降级：长度+抽样
   const bytes = new Uint8Array(data);
   let h = bytes.length;
   for (let i = 0; i < bytes.length; i += Math.max(1, Math.floor(bytes.length / 32))) {
