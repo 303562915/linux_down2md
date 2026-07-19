@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Local large exports / generated notes
+*.html
+!extension/**/*.html
+*.md
+!README.md
+!extension/**/*.md
+
+# Secrets / local dumps
+.env
+*.log
+_*.py
+_*.json
+_*.txt
+_*.html
+_*.md

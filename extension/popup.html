@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>L站笔记导出</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="logo">N</div>
+    <div>
+      <h1>L站 → Obsidian</h1>
+      <p class="sub" id="pageStatus">检测当前页面…</p>
+    </div>
+  </header>
+
+  <section class="card" id="topicCard" hidden>
+    <div class="topic-title" id="topicTitle">—</div>
+    <div class="topic-meta" id="topicMeta"></div>
+  </section>
+
+  <section class="card">
+    <label class="field-label">导出范围</label>
+    <div class="seg seg-4" role="radiogroup">
+      <label class="seg-item">
+        <input type="radio" name="mode" value="all" checked />
+        <span>全部</span>
+      </label>
+      <label class="seg-item">
+        <input type="radio" name="mode" value="author" />
+        <span>仅贴主</span>
+      </label>
+      <label class="seg-item">
+        <input type="radio" name="mode" value="op" />
+        <span>仅一楼</span>
+      </label>
+      <label class="seg-item">
+        <input type="radio" name="mode" value="range" />
+        <span>范围</span>
+      </label>
+    </div>
+    <p class="mode-hint" id="modeHint">导出主题内所有楼层</p>
+    <div class="range-row" id="rangeRow" hidden>
+      <input type="number" id="fromFloor" min="1" placeholder="从" value="1" />
+      <span>—</span>
+      <input type="number" id="toFloor" min="1" placeholder="到" />
+    </div>
+  </section>
+
+  <section class="card">
+    <label class="field-label">图片处理</label>
+    <div class="seg seg-3" role="radiogroup">
+      <label class="seg-item">
+        <input type="radio" name="imageMode" value="base64" checked />
+        <span>Base64</span>
+      </label>
+      <label class="seg-item">
+        <input type="radio" name="imageMode" value="webdav" />
+        <span>WebDAV</span>
+      </label>
+      <label class="seg-item">
+        <input type="radio" name="imageMode" value="url" />
+        <span>仅链接</span>
+      </label>
+    </div>
+    <p class="mode-hint" id="imageModeHint">默认：图片内嵌 base64，笔记可离线打开</p>
+  </section>
+
+  <section class="card" id="webdavCard" hidden>
+    <div class="card-head">
+      <label class="field-label" style="margin:0">WebDAV 设置</label>
+      <button type="button" class="btn-mini" id="btnTogglePwd" title="显示/隐藏密码">显示</button>
+    </div>
+    <p class="warn-text">
+      账号密码仅保存在本机扩展存储。建议使用坚果云「应用密码」。
+    </p>
+
+    <label class="field-label" for="davUrl">服务器地址</label>
+    <input id="davUrl" class="text-input" type="url" placeholder="https://dav.jianguoyun.com/dav/" spellcheck="false" />
+
+    <div class="two-col">
+      <div>
+        <label class="field-label" for="davUser">用户名</label>
+        <input id="davUser" class="text-input" type="text" placeholder="邮箱" autocomplete="username" spellcheck="false" />
+      </div>
+      <div>
+        <label class="field-label" for="davPass">密码</label>
+        <input id="davPass" class="text-input" type="password" placeholder="应用密码" autocomplete="current-password" />
+      </div>
+    </div>
+
+    <label class="field-label" for="davRoot">同步根目录</label>
+    <input id="davRoot" class="text-input" type="text" placeholder="/grow  或  /" spellcheck="false" />
+
+    <label class="field-label">
+      图片保存文件夹
+      <span class="label-tip">点选切换</span>
+    </label>
+    <div class="path-row">
+      <input id="davImagePath" class="text-input" type="text" placeholder="/grow/attachments" spellcheck="false" />
+      <button type="button" class="btn ghost btn-sm" id="btnBrowseDav">选择</button>
+    </div>
+
+    <div class="folder-browser" id="folderBrowser" hidden>
+      <div class="folder-bar">
+        <button type="button" class="btn-mini" id="btnFolderUp">上级</button>
+        <span class="folder-cur" id="folderCur">/</span>
+        <button type="button" class="btn-mini" id="btnFolderRefresh">刷新</button>
+      </div>
+      <div class="folder-list" id="folderList"></div>
+      <div class="folder-actions">
+        <input id="newFolderName" class="text-input" type="text" placeholder="新建文件夹名" />
+        <button type="button" class="btn ghost btn-sm" id="btnNewFolder">新建</button>
+        <button type="button" class="btn primary btn-sm" id="btnUseFolder">用此目录</button>
+      </div>
+    </div>
+
+    <label class="field-label" for="davLinkStyle">笔记中的图片链接</label>
+    <select id="davLinkStyle" class="select-input full">
+      <option value="relative" selected>相对路径（attachments/xxx.png，推荐 Obsidian）</option>
+      <option value="absolute">WebDAV 绝对地址</option>
+      <option value="public">公开访问前缀</option>
+    </select>
+
+    <div id="publicUrlRow" hidden>
+      <label class="field-label" for="davPublicUrl">公开访问前缀</label>
+      <input id="davPublicUrl" class="text-input" type="url" placeholder="https://cdn.example.com/grow" spellcheck="false" />
+    </div>
+
+    <label class="field-label" for="davNotePrefix">相对路径前缀（可选）</label>
+    <input id="davNotePrefix" class="text-input" type="text" placeholder="留空=用文件夹名，如 attachments" spellcheck="false" />
+
+    <div class="dav-actions">
+      <button type="button" class="btn ghost btn-sm" id="btnTestDav">测试连接</button>
+      <span class="dav-status" id="davStatus"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <label class="field-label" for="vaultPath">
+      Obsidian 笔记路径
+      <span class="label-tip">相对「下载」目录</span>
+    </label>
+    <input
+      type="text"
+      id="vaultPath"
+      class="text-input"
+      placeholder="例如：Obsidian/LinuxDo  或  MyVault/论坛"
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <p class="mode-hint" id="pathPreview">保存到：浏览器默认下载目录</p>
+    <label class="check path-check">
+      <input type="checkbox" id="askSaveAs" />
+      <span>每次弹出另存为（忽略上方路径）</span>
+    </label>
+  </section>
+
+  <section class="card opts">
+    <label class="check">
+      <input type="checkbox" id="skipEmoji" checked />
+      <span>Emoji 用文本（:name:）减小体积</span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="includeMeta" checked />
+      <span>写入 YAML frontmatter / 元信息</span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="compactPostHeader" />
+      <span>楼层用加粗（不进大纲，更干净）</span>
+    </label>
+    <div class="inline-field">
+      <label class="field-label" for="postHeadingLevel">楼层标题级别</label>
+      <select id="postHeadingLevel" class="select-input">
+        <option value="3">### 三级</option>
+        <option value="4" selected>#### 四级（推荐）</option>
+        <option value="5">##### 五级</option>
+        <option value="6">###### 六级</option>
+      </select>
+    </div>
+  </section>
+
+  <div class="progress" id="progress" hidden>
+    <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+    <div class="progress-text" id="progressText">准备中…</div>
+  </div>
+
+  <div class="actions">
+    <button id="btnExport" class="btn primary" disabled>导出 Markdown 笔记</button>
+    <button id="btnCopy" class="btn ghost" disabled title="先导出成功后可复制">复制 MD</button>
+  </div>
+
+  <p class="hint" id="hint">
+    默认 Base64 内嵌图；选 WebDAV 则上传到你指定的文件夹，笔记里写文件链接。
+  </p>
+  <p class="err" id="err" hidden></p>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
