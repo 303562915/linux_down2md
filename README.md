@@ -12,7 +12,7 @@
 1. Chrome/Edge 打开 扩展 → 开发者模式
 2. 「加载已解压的扩展程序」→ 选 extension 文件夹
 3. 点击扩展图标 → 右侧打开侧边栏
-4. 打开主题帖 → 在侧边栏导出（或点页面右下角按钮）
+4. 打开主题帖 → 在侧边栏导出
 ```
 
 详见 [extension/README.md](./extension/README.md)
