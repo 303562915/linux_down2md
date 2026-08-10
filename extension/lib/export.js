@@ -90,6 +90,59 @@ async function rewriteRawMarkdownImages(markdown, resolveImage) {
   return lines.join("");
 }
 
+function absoluteRawUrl(url, origin) {
+  const value = String(url || "").trim();
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `${origin}${value}`;
+  return value;
+}
+
+function normalizeRawLinks(markdown, origin) {
+  return String(markdown || "").replace(
+    /(^|[^!])\[([^\]]+)\]\((\/\/[^\s)]+|\/[^\s)]+)(\s+[^)]*)?\)/gm,
+    (_full, prefix, label, url, suffix = "") =>
+      `${prefix}[${label}](${absoluteRawUrl(url, origin)}${suffix})`
+  );
+}
+
+function quoteHeader(attrs, origin) {
+  const values = Object.fromEntries(
+    String(attrs || "")
+      .split(",")
+      .map((part) => part.trim())
+      .map((part) => {
+        const [key, ...rest] = part.split(":");
+        return [key?.trim(), rest.join(":").trim()];
+      })
+      .filter(([key]) => key)
+  );
+  const name = String(attrs || "").split(",")[0].trim() || values.username || "引用";
+  const author = values.username
+    ? `[${name}](${origin}/u/${encodeURIComponent(values.username)})`
+    : name;
+  const source = values.topic && values.post
+    ? ` [原帖](${origin}/t/topic/${values.topic}/${values.post})`
+    : "";
+  return `**${author}**${source}`;
+}
+
+function normalizeRawDiscourseMarkup(markdown, origin) {
+  let out = String(markdown || "");
+  // 论坛 Raw 使用 BBCode 引用；转换为标准 Markdown，保留作者与原帖链接。
+  out = out.replace(/\[quote="([^"]*)"\]\s*([\s\S]*?)\s*\[\/quote\]/gi, (_full, attrs, body) => {
+    const quoted = `${quoteHeader(attrs, origin)}\n${body.trim()}`;
+    return quoted
+      .split("\n")
+      .map((line) => (line ? `> ${line}` : ">"))
+      .join("\n");
+  });
+  out = out.replace(/\[details="([^"]*)"\]\s*([\s\S]*?)\s*\[\/details\]/gi, (_full, title, body) => {
+    const folded = body.trim().split("\n").map((line) => (line ? `> ${line}` : ">"));
+    return `> [!note]- ${title}\n${folded.join("\n")}`;
+  });
+  return normalizeRawLinks(out, origin);
+}
+
 function countRawMarkdownImages(markdown) {
   return (String(markdown || "").match(/!\[[^\]]*\]\(/g) || []).length;
 }
@@ -98,7 +151,7 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function rawPageCandidates(topic, mode, from, to) {
+function rawPageCandidates(topic, posts, mode, from, to, origin, topicId) {
   const highest = Math.max(
     Number(topic?.highest_post_number) || 0,
     Number(topic?.posts_count) || 0,
@@ -118,12 +171,21 @@ function rawPageCandidates(topic, mode, from, to) {
   for (let page = firstPage; page <= lastPage; page += 1) {
     const pageStart = (page - 1) * pageSize + 1;
     const pageEnd = Math.min(highest, page * pageSize);
+    const authors = (posts || [])
+      .filter((post) => post.post_number >= pageStart && post.post_number <= pageEnd)
+      .map((post) => ({
+        number: post.post_number,
+        name: post.name || post.username || "匿名",
+        url: post.username ? `${origin}/u/${encodeURIComponent(post.username)}` : "",
+      }));
     pages.push({
       page,
       post_number: `第 ${page} 页（${pageStart}-${pageEnd} 楼）`,
       pageStart,
       pageEnd,
       postCount: pageEnd - pageStart + 1,
+      authors,
+      pageUrl: `${origin}/t/topic/${topicId}/${pageStart}`,
     });
   }
   return pages;
@@ -174,14 +236,25 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
   const { origin, topicId } = parsed;
   const rawPageMode = contentSource === "raw" && opts.mode === "all";
   const rawSummaryMode = contentSource === "raw" && opts.mode !== "author";
-  const fetched = rawSummaryMode
-    ? await fetchTopicSummary(origin, topicId, onProgress)
-    : await fetchFullTopic(origin, topicId, onProgress);
+  const rawAuthorProgress = (progress) => {
+    if (progress?.phase === "posts") {
+      onProgress({
+        ...progress,
+        message: `读取楼层作者索引 ${progress.done}/${progress.total}`,
+      });
+      return;
+    }
+    onProgress(progress);
+  };
+  // 分页 Raw 需读取楼层索引，才能把每页作者恢复为可点击的个人链接。
+  const fetched = rawPageMode || !rawSummaryMode
+    ? await fetchFullTopic(origin, topicId, rawPageMode ? rawAuthorProgress : onProgress)
+    : await fetchTopicSummary(origin, topicId, onProgress);
   const { topic, posts } = fetched;
 
   // 过滤楼层
   let selected = rawPageMode
-    ? rawPageCandidates(topic, opts.mode, opts.from, opts.to)
+    ? rawPageCandidates(topic, posts, opts.mode, opts.from, opts.to, origin, topicId)
     : rawSummaryMode
       ? rawPostCandidates(topic, opts.mode, opts.from, opts.to)
       : posts;
@@ -395,10 +468,10 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
         }
         throw error;
       }
-      if (imageMode !== "url") {
-        imgTotal += countRawMarkdownImages(contentMd);
-        contentMd = await rewriteRawMarkdownImages(contentMd, resolveImage);
-      }
+      contentMd = normalizeRawDiscourseMarkup(contentMd, origin);
+      if (imageMode !== "url") imgTotal += countRawMarkdownImages(contentMd);
+      // L站链接模式也需要把 Raw 中的相对图片 URL 补为完整域名。
+      contentMd = await rewriteRawMarkdownImages(contentMd, resolveImage);
       contentMd = contentMd.trim();
     } else {
       contentMd = await htmlToMarkdown(p.cooked || "", {
@@ -419,6 +492,8 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       replyTo: !rawSummaryMode && p.reply_to_user
         ? `回复 @${p.reply_to_user.username || p.reply_to_user}`
         : "",
+      authors: rawPageMode ? p.authors || [] : [],
+      pageUrl: rawPageMode ? p.pageUrl || "" : "",
       contentMd,
     });
 
@@ -581,6 +656,16 @@ function buildMarkdown({
     }
     if (p.authorUrl) {
       lines.push(`*作者*: [${p.author}](${p.authorUrl})`, "");
+    }
+    if (p.pageUrl) {
+      lines.push(`*论坛页*: [打开此页](${p.pageUrl})`, "");
+    }
+    if (p.authors?.length) {
+      const authorLinks = p.authors.map((author) => {
+        const label = `${author.number} · ${author.name}`;
+        return author.url ? `[${label}](${author.url})` : label;
+      });
+      lines.push(`*楼层作者*: ${authorLinks.join(" · ")}`, "");
     }
     if (p.replyTo) {
       lines.push(`> ${p.replyTo}`, "");
