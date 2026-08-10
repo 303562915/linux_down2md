@@ -30,6 +30,7 @@ const ui = {
   modeHint: $("modeHint"),
   fromFloor: $("fromFloor"),
   toFloor: $("toFloor"),
+  contentSourceHint: $("contentSourceHint"),
   imageModeHint: $("imageModeHint"),
   webdavCard: $("webdavCard"),
   davUrl: $("davUrl"),
@@ -92,12 +93,18 @@ const IMAGE_MODE_HINTS = {
   webdav: "上传到图片路径",
 };
 
+const CONTENT_SOURCE_HINTS = {
+  html: "读取页面 HTML 后转换为 Markdown",
+  raw: "直接读取论坛 Raw Markdown，不经过 HTML 转换",
+};
+
 const DEFAULT_SETTINGS = {
   includeImages: true,
   imageMode: "url",
   skipEmoji: true,
   includeMeta: true,
   mode: "all",
+  contentSource: "html",
   enableNoteSync: false, // 本地导出，默认关
   enableDavNoteUpload: false, // 笔记上传 WebDAV，默认关
   noteFolderName: "",
@@ -153,6 +160,11 @@ function modeValue() {
 function imageModeValue() {
   const el = document.querySelector('input[name="imageMode"]:checked');
   return el ? el.value : "url";
+}
+
+function contentSourceValue() {
+  const el = document.querySelector('input[name="contentSource"]:checked');
+  return el ? el.value : "html";
 }
 
 function setDavPathDisplay(hiddenInput, displayEl, path, fallback = "/") {
@@ -221,6 +233,13 @@ function updateImageModeUi() {
   }
 }
 
+function updateContentSourceUi() {
+  const source = contentSourceValue();
+  if (ui.contentSourceHint) {
+    ui.contentSourceHint.textContent = CONTENT_SOURCE_HINTS[source] || "";
+  }
+}
+
 function updateModeUi() {
   const mode = modeValue();
   ui.rangeRow.hidden = mode !== "range";
@@ -282,6 +301,7 @@ async function saveSettings() {
     skipEmoji: ui.skipEmoji.checked,
     includeMeta: ui.includeMeta.checked,
     mode: modeValue(),
+    contentSource: contentSourceValue(),
     enableNoteSync: !!ui.enableNoteSync.checked,
     enableDavNoteUpload: !!ui.enableDavNoteUpload?.checked,
     noteFolderName: noteDirHandle?.name || "",
@@ -297,6 +317,7 @@ async function saveSettings() {
   });
   updatePathPreview();
   updateImageModeUi();
+  updateContentSourceUi();
   updateNoteSyncUi();
   updateDavNoteUploadUi();
 }
@@ -508,6 +529,12 @@ function bindUi() {
       saveSettings();
     });
   });
+  document.querySelectorAll('input[name="contentSource"]').forEach((el) => {
+    el.addEventListener("change", () => {
+      updateContentSourceUi();
+      saveSettings();
+    });
+  });
 
   [
     ui.skipEmoji,
@@ -612,6 +639,23 @@ async function doExport() {
   ui.btnExport.disabled = true;
   showError("");
   setProgress(2, "开始导出…");
+
+  // 文件夹选择器必须在点击「导出」的用户手势内打开，不能等长耗时导出完成后再弹。
+  if (ui.enableNoteSync?.checked && !noteDirHandle && supportsDirectoryPicker()) {
+    try {
+      const picked = await pickNoteDirectory();
+      noteDirHandle = picked.handle;
+      updateNoteFolderDisplay(picked.name);
+      await chrome.storage.local.set({ noteFolderName: picked.name, enableNoteSync: true });
+      updatePathPreview();
+    } catch (e) {
+      if (e?.name !== "AbortError") showError(e?.message || String(e));
+      ui.progress.hidden = true;
+      ui.btnExport.disabled = false;
+      return;
+    }
+  }
+
   await saveSettings();
 
   const imageMode = imageModeValue();
@@ -630,6 +674,7 @@ async function doExport() {
 
   const options = {
     mode: modeValue(),
+    contentSource: contentSourceValue(),
     from: Number(ui.fromFloor.value) || 1,
     to: Number(ui.toFloor.value) || undefined,
     includeImages: imageMode !== "url",
@@ -664,17 +709,7 @@ async function doExport() {
         parts.push(`本地 ${noteDirHandle.name}/`);
         result.filename = savedName;
       } else if (supportsDirectoryPicker()) {
-        const picked = await pickNoteDirectory();
-        noteDirHandle = picked.handle;
-        updateNoteFolderDisplay(picked.name);
-        const savedName = await writeMarkdownToDirectory(
-          noteDirHandle,
-          result.filename,
-          result.markdown
-        );
-        parts.push(`本地 ${picked.name}/`);
-        result.filename = savedName;
-        await chrome.storage.local.set({ noteFolderName: picked.name });
+        throw new Error("请先点击「浏览选择」设置本地文件夹，再导出");
       } else {
         const dl = await chrome.runtime.sendMessage({
           type: "DOWNLOAD_MARKDOWN",
@@ -762,6 +797,12 @@ async function main() {
   const modeEl = document.querySelector(`input[name="mode"][value="${mode}"]`);
   if (modeEl) modeEl.checked = true;
 
+  const contentSource = settings.contentSource === "raw" ? "raw" : "html";
+  const sourceEl = document.querySelector(
+    `input[name="contentSource"][value="${contentSource}"]`
+  );
+  if (sourceEl) sourceEl.checked = true;
+
   let imageMode = settings.imageMode || "url";
   if (!settings.imageMode && settings.includeImages === false) imageMode = "url";
   const imgEl = document.querySelector(`input[name="imageMode"][value="${imageMode}"]`);
@@ -783,6 +824,7 @@ async function main() {
   }
 
   updateModeUi();
+  updateContentSourceUi();
   updateImageModeUi();
   updateNoteSyncUi();
   updateDavNoteUploadUi();

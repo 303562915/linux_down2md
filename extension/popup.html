@@ -49,6 +49,21 @@
   </section>
 
   <section class="card">
+    <label class="field-label">正文来源</label>
+    <div class="seg seg-2" role="radiogroup">
+      <label class="seg-item">
+        <input type="radio" name="contentSource" value="html" checked />
+        <span>HTML 转换</span>
+      </label>
+      <label class="seg-item">
+        <input type="radio" name="contentSource" value="raw" />
+        <span>Raw Markdown</span>
+      </label>
+    </div>
+    <p class="mode-hint" id="contentSourceHint">读取页面 HTML 后转换为 Markdown</p>
+  </section>
+
+  <section class="card">
     <label class="field-label">图片处理</label>
     <div class="seg seg-3" role="radiogroup">
       <label class="seg-item">

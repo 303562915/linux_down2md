@@ -144,6 +144,7 @@ h1 {
 }
 
 .seg.seg-3 { grid-template-columns: repeat(3, 1fr); }
+.seg.seg-2 { grid-template-columns: repeat(2, 1fr); }
 .seg.seg-4 { grid-template-columns: repeat(4, 1fr); }
 
 .seg-item { position: relative; cursor: pointer; }

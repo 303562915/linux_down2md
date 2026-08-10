@@ -163,6 +163,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === "EXT_FETCH_TEXT") {
+    (async () => {
+      try {
+        const res = await fetch(msg.url, {
+          credentials: "include",
+          headers: { Accept: "text/plain, text/markdown;q=0.9, */*;q=0.8" },
+        });
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          throw new Error(`HTTP ${res.status}: ${msg.url}\n${body.slice(0, 200)}`);
+        }
+        sendResponse({ ok: true, data: await res.text() });
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message || String(e) });
+      }
+    })();
+    return true;
+  }
+
   if (msg.type === "EXT_FETCH_DATA_URL") {
     (async () => {
       try {

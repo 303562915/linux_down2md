@@ -7,7 +7,7 @@
 
 - 侧边栏：全部楼层 / **仅贴主** / 仅一楼 / 楼层范围
 - 自动分页拉取全部 `post_stream` 楼层
-- HTML → Markdown（标题、列表、引用、代码、表格、details 折叠）
+- 正文来源可选：HTML → Markdown（默认）或论坛 Raw Markdown（不经过 HTML 转换）
 - 图片 base64；emoji 可改成 `:name:`
 - YAML frontmatter（title / source / tags / topic_id）
 
@@ -30,7 +30,7 @@
 2. 打开任意主题帖，例如：  
    `https://linux.do/t/slug/772045`
 3. **点击扩展图标** → 浏览器右侧打开 **侧边栏**
-4. 在侧边栏里选范围 / 图片模式 / WebDAV → **导出笔记**
+4. 在侧边栏里选范围 / 正文来源 / 图片模式 / WebDAV → **导出笔记**
 
 侧边栏会随你切换标签页自动刷新当前主题信息；也可点标题旁 **刷新**。
 
@@ -44,6 +44,17 @@
 | 范围 | 按楼层号区间导出 |
 
 文件名会带后缀，例如：`772045-标题-贴主.md`
+
+### 正文来源
+
+| 模式 | 说明 |
+|------|------|
+| **HTML 转换**（默认） | 使用 Discourse 的 cooked HTML，再转换为适合 Obsidian 的 Markdown；正文标题会按设置下沉。 |
+| **Raw Markdown** | 按楼层读取论坛 `/raw/{topicId}/{postNumber}` 原文，不经过 HTML 转换，可保留作者原始 Markdown。 |
+
+Raw 的全部 / 一楼 / 范围模式只读取主题摘要后直接取原文，不会额外分页拉取 cooked HTML；因此这些模式的楼层标题只显示楼层号。仅贴主模式需要先读楼层索引，才能筛出贴主回复。图片保持 L 站链接时会原样保留；选择 Base64 或 WebDAV 时会改写 Markdown 中的图片链接。
+
+Raw 大主题按约每秒一层节流；遇到论坛限流会等待后重试，请保持侧边栏打开直到完成。
 
 ### Obsidian 适配
 
@@ -101,6 +112,7 @@
 ### 笔记路径（可选）
 
 侧边栏可勾选「开启笔记下载路径」；关闭则走浏览器默认下载/另存为。
+启用本地文件夹但尚未选择路径时，点击「导出笔记」会先打开文件夹选择器，再开始导出。
 
 ### 推荐选项
 
@@ -122,7 +134,7 @@ extension/
   lib/
     discourse.js        # 拉主题 API
     html2md.js          # cooked HTML → MD
-    export.js           # 组装笔记
+    export.js           # HTML / Raw 正文与笔记组装
     webdav.js           # WebDAV 上传
   icons/
 ```

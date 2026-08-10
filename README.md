@@ -6,7 +6,7 @@
 
 目录：[`extension/`](./extension/)
 
-在 linux.do 主题页一键导出 Markdown（图片可 base64 / WebDAV），直接丢进 Obsidian。
+在 linux.do 主题页一键导出 Markdown（默认 HTML 转换，也可直取论坛 Raw Markdown；图片可 base64 / WebDAV），直接丢进 Obsidian。
 
 ```
 1. Chrome/Edge 打开 扩展 → 开发者模式

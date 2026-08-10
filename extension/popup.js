@@ -20,6 +20,7 @@ const ui = {
   modeHint: $("modeHint"),
   fromFloor: $("fromFloor"),
   toFloor: $("toFloor"),
+  contentSourceHint: $("contentSourceHint"),
   imageModeHint: $("imageModeHint"),
   webdavCard: $("webdavCard"),
   davUrl: $("davUrl"),
@@ -72,12 +73,18 @@ const IMAGE_MODE_HINTS = {
   url: "不下载图片，笔记保留原 CDN 链接（需联网）",
 };
 
+const CONTENT_SOURCE_HINTS = {
+  html: "读取页面 HTML 后转换为 Markdown",
+  raw: "直接读取论坛 Raw Markdown，不经过 HTML 转换",
+};
+
 const DEFAULT_SETTINGS = {
   includeImages: true,
   imageMode: "base64",
   skipEmoji: true,
   includeMeta: true,
   mode: "all",
+  contentSource: "html",
   vaultPath: "",
   askSaveAs: false,
   compactPostHeader: false,
@@ -130,6 +137,11 @@ function imageModeValue() {
   return el ? el.value : "base64";
 }
 
+function contentSourceValue() {
+  const el = document.querySelector('input[name="contentSource"]:checked');
+  return el ? el.value : "html";
+}
+
 function sanitizeVaultSubpath(raw) {
   let p = String(raw || "").trim();
   if (!p) return "";
@@ -172,6 +184,13 @@ function updateImageModeUi() {
   if (ui.webdavCard) ui.webdavCard.hidden = mode !== "webdav";
   if (ui.publicUrlRow) {
     ui.publicUrlRow.hidden = ui.davLinkStyle.value !== "public";
+  }
+}
+
+function updateContentSourceUi() {
+  const source = contentSourceValue();
+  if (ui.contentSourceHint) {
+    ui.contentSourceHint.textContent = CONTENT_SOURCE_HINTS[source] || "";
   }
 }
 
@@ -224,6 +243,7 @@ async function saveSettings() {
     skipEmoji: ui.skipEmoji.checked,
     includeMeta: ui.includeMeta.checked,
     mode: modeValue(),
+    contentSource: contentSourceValue(),
     vaultPath: sanitizeVaultSubpath(ui.vaultPath.value),
     askSaveAs: !!ui.askSaveAs.checked,
     compactPostHeader: !!ui.compactPostHeader.checked,
@@ -240,6 +260,7 @@ async function saveSettings() {
   });
   updatePathPreview();
   updateImageModeUi();
+  updateContentSourceUi();
 }
 
 function setDavStatus(text, type = "") {
@@ -383,6 +404,12 @@ function bindUi() {
       saveSettings();
     });
   });
+  document.querySelectorAll('input[name="contentSource"]').forEach((el) => {
+    el.addEventListener("change", () => {
+      updateContentSourceUi();
+      saveSettings();
+    });
+  });
 
   [
     ui.skipEmoji,
@@ -514,6 +541,7 @@ async function doExport() {
 
   const options = {
     mode: modeValue(),
+    contentSource: contentSourceValue(),
     from: Number(ui.fromFloor.value) || 1,
     to: Number(ui.toFloor.value) || undefined,
     includeImages: imageMode !== "url",
@@ -599,6 +627,12 @@ async function main() {
   const modeEl = document.querySelector(`input[name="mode"][value="${mode}"]`);
   if (modeEl) modeEl.checked = true;
 
+  const contentSource = settings.contentSource === "raw" ? "raw" : "html";
+  const sourceEl = document.querySelector(
+    `input[name="contentSource"][value="${contentSource}"]`
+  );
+  if (sourceEl) sourceEl.checked = true;
+
   let imageMode = settings.imageMode || "base64";
   // 兼容旧 includeImages
   if (!settings.imageMode && settings.includeImages === false) imageMode = "url";
@@ -607,6 +641,7 @@ async function main() {
 
   fillWebdavForm(settings.webdav || {});
   updateModeUi();
+  updateContentSourceUi();
   updateImageModeUi();
   updatePathPreview();
 
