@@ -50,11 +50,11 @@
 | 模式 | 说明 |
 |------|------|
 | **HTML 转换**（默认） | 使用 Discourse 的 cooked HTML，再转换为适合 Obsidian 的 Markdown；正文标题会按设置下沉。 |
-| **Raw Markdown** | 按楼层读取论坛 `/raw/{topicId}/{postNumber}` 原文，不经过 HTML 转换，可保留作者原始 Markdown。 |
+| **Raw Markdown** | 全帖按论坛 `/raw/{topicId}?page=N` 分页读取原文，不经过 HTML 转换，可保留作者原始 Markdown。 |
 
-Raw 的全部 / 一楼 / 范围模式只读取主题摘要后直接取原文，不会额外分页拉取 cooked HTML；因此这些模式的楼层标题只显示楼层号。仅贴主模式需要先读楼层索引，才能筛出贴主回复。图片保持 L 站链接时会原样保留；选择 Base64 或 WebDAV 时会改写 Markdown 中的图片链接。
+Raw 的全部模式只读取主题摘要后按 `page=1, 2, 3…` 取原文，不会额外分页拉取 cooked HTML，也不会逐层请求 Raw。仅一楼和精确楼层范围只请求所选楼层；仅贴主模式需要先读楼层索引，才能筛出贴主回复。图片保持 L 站链接时会原样保留；选择 Base64 或 WebDAV 时会改写 Markdown 中的图片链接。
 
-Raw 大主题按约每秒一层节流；遇到论坛限流会等待后重试，请保持侧边栏打开直到完成。
+Raw 分页请求间保留短间隔；遇到论坛限流会等待后重试，请保持侧边栏打开直到完成。
 
 ### Obsidian 适配
 

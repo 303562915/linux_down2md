@@ -133,6 +133,14 @@ export async function fetchRawPost(origin, topicId, postNumber, onRetry) {
   return fetchTextWithRetry(`${base}/raw/${topic}/${post}`, onRetry);
 }
 
+/** 获取主题某一页的原始 Markdown（linux.do Raw 分页接口）。 */
+export async function fetchRawTopicPage(origin, topicId, page, onRetry) {
+  const base = origin.replace(/\/$/, "");
+  const topic = encodeURIComponent(String(topicId));
+  const pageNumber = Math.max(1, Number(page) || 1);
+  return fetchTextWithRetry(`${base}/raw/${topic}?page=${pageNumber}`, onRetry);
+}
+
 /**
  * 只读取主题摘要和首屏楼层，不分页取得全部 cooked HTML。
  * Raw 导出全部/范围时用它确定最高楼层后即可直接请求 /raw。

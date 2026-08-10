@@ -2,6 +2,7 @@ import { htmlToMarkdown, yamlEscape, safeFilename } from "./html2md.js";
 import {
   fetchFullTopic,
   fetchRawPost,
+  fetchRawTopicPage,
   fetchTopicSummary,
   imageUrlToDataUrl,
   imageUrlToBytes,
@@ -97,25 +98,48 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function rawPostCandidates(topic, firstPosts, mode, from, to) {
-  const byNumber = new Map(
-    (firstPosts || []).map((post) => [Number(post.post_number), post])
-  );
+function rawPageCandidates(topic, mode, from, to) {
   const highest = Math.max(
     Number(topic?.highest_post_number) || 0,
     Number(topic?.posts_count) || 0,
-    ...byNumber.keys(),
     1
   );
+  // linux.do Raw 分页与主题默认分页一致：每页 20 层。
+  const pageSize = Number(topic?.chunk_size) || 20;
   const start = mode === "op" ? 1 : mode === "range" ? Math.max(1, Number(from) || 1) : 1;
   const end = mode === "op"
     ? 1
     : mode === "range"
       ? Math.min(highest, Number(to) || highest)
       : highest;
+  const firstPage = Math.floor((start - 1) / pageSize) + 1;
+  const lastPage = Math.floor((end - 1) / pageSize) + 1;
+  const pages = [];
+  for (let page = firstPage; page <= lastPage; page += 1) {
+    const pageStart = (page - 1) * pageSize + 1;
+    const pageEnd = Math.min(highest, page * pageSize);
+    pages.push({
+      page,
+      post_number: `第 ${page} 页（${pageStart}-${pageEnd} 楼）`,
+      pageStart,
+      pageEnd,
+      postCount: pageEnd - pageStart + 1,
+    });
+  }
+  return pages;
+}
+
+function rawPostCandidates(topic, mode, from, to) {
+  const highest = Math.max(
+    Number(topic?.highest_post_number) || 0,
+    Number(topic?.posts_count) || 0,
+    1
+  );
+  const start = mode === "op" ? 1 : Math.max(1, Number(from) || 1);
+  const end = mode === "op" ? 1 : Math.min(highest, Number(to) || highest);
   const posts = [];
   for (let number = start; number <= end; number += 1) {
-    posts.push(byNumber.get(number) || { post_number: number });
+    posts.push({ post_number: number });
   }
   return posts;
 }
@@ -148,20 +172,23 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
   }
 
   const { origin, topicId } = parsed;
-  const rawWithoutAuthorFilter = contentSource === "raw" && opts.mode !== "author";
-  const fetched = rawWithoutAuthorFilter
+  const rawPageMode = contentSource === "raw" && opts.mode === "all";
+  const rawSummaryMode = contentSource === "raw" && opts.mode !== "author";
+  const fetched = rawSummaryMode
     ? await fetchTopicSummary(origin, topicId, onProgress)
     : await fetchFullTopic(origin, topicId, onProgress);
   const { topic, posts } = fetched;
 
   // 过滤楼层
-  let selected = rawWithoutAuthorFilter
-    ? rawPostCandidates(topic, posts, opts.mode, opts.from, opts.to)
-    : posts;
+  let selected = rawPageMode
+    ? rawPageCandidates(topic, opts.mode, opts.from, opts.to)
+    : rawSummaryMode
+      ? rawPostCandidates(topic, opts.mode, opts.from, opts.to)
+      : posts;
   let authorUsername = "";
-  if (!rawWithoutAuthorFilter && opts.mode === "op") {
+  if (!rawSummaryMode && opts.mode === "op") {
     selected = posts.filter((p) => p.post_number === 1);
-  } else if (!rawWithoutAuthorFilter && opts.mode === "author") {
+  } else if (!rawSummaryMode && opts.mode === "author") {
     authorUsername = resolveTopicAuthor(topic, posts);
     if (!authorUsername) {
       throw new Error("无法识别贴主，请改用「仅一楼」或「全部楼层」");
@@ -175,7 +202,7 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     if (!selected.length) {
       selected = posts.filter((p) => p.post_number === 1);
     }
-  } else if (!rawWithoutAuthorFilter && opts.mode === "range") {
+  } else if (!rawSummaryMode && opts.mode === "range") {
     const from = Number(opts.from) || 1;
     const to = Number(opts.to) || Infinity;
     selected = posts.filter(
@@ -337,7 +364,16 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     let contentMd;
     if (contentSource === "raw") {
       try {
-        contentMd = await fetchRawPost(origin, topicId, p.post_number, ({ attempt, delayMs }) => {
+        const fetchRaw = rawPageMode
+          ? fetchRawTopicPage(origin, topicId, p.page, ({ attempt, delayMs }) => {
+              onProgress({
+                phase: "convert",
+                done: i,
+                total: selected.length,
+                message: `Raw 第 ${p.page} 页请求过快，${Math.ceil(delayMs / 1000)} 秒后重试（第 ${attempt} 次）…`,
+              });
+            })
+          : fetchRawPost(origin, topicId, p.post_number, ({ attempt, delayMs }) => {
           onProgress({
             phase: "convert",
             done: i,
@@ -345,9 +381,10 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
             message: `Raw 请求过快，${Math.ceil(delayMs / 1000)} 秒后重试（第 ${attempt} 次）…`,
           });
         });
+        contentMd = await fetchRaw;
       } catch (error) {
-        // 已删除的楼层没有 /raw 响应；Raw 快速路径无需为此中断整个主题导出。
-        if (rawWithoutAuthorFilter && isNotFoundError(error)) {
+        // 已删除的楼层没有单层 /raw 响应；仅贴主模式无需为此中断整个主题导出。
+        if (rawSummaryMode && isNotFoundError(error)) {
           onProgress({
             phase: "convert",
             done: i + 1,
@@ -373,13 +410,13 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
 
     postBlocks.push({
       number: p.post_number,
-      // 快速 Raw 路径不请求全部帖子索引，避免二次拉取 cooked HTML。
-      author: rawWithoutAuthorFilter ? "" : p.name || p.username || "匿名",
-      username: rawWithoutAuthorFilter ? "" : p.username || "",
+      // 分页 Raw 路径不请求全部帖子索引，避免二次拉取 cooked HTML。
+      author: rawSummaryMode ? "" : p.name || p.username || "匿名",
+      username: rawSummaryMode ? "" : p.username || "",
       authorUrl:
-        !rawWithoutAuthorFilter && p.username ? `${origin}/u/${p.username}` : "",
-      createdAt: rawWithoutAuthorFilter ? "" : formatDiscourseDate(p.created_at),
-      replyTo: !rawWithoutAuthorFilter && p.reply_to_user
+        !rawSummaryMode && p.username ? `${origin}/u/${p.username}` : "",
+      createdAt: rawSummaryMode ? "" : formatDiscourseDate(p.created_at),
+      replyTo: !rawSummaryMode && p.reply_to_user
         ? `回复 @${p.reply_to_user.username || p.reply_to_user}`
         : "",
       contentMd,
@@ -391,12 +428,16 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       total: selected.length,
       message:
         contentSource === "raw"
-          ? `读取原文 ${i + 1}/${selected.length}`
+          ? rawPageMode
+            ? `读取 Raw 第 ${i + 1}/${selected.length} 页`
+            : `读取原文 ${i + 1}/${selected.length}`
           : `转换楼层 ${i + 1}/${selected.length}`,
     });
 
-    // Raw 是一层一请求；控制到约 1 req/s，避免 Cloudflare 在大主题中途限流。
-    if (contentSource === "raw" && i + 1 < selected.length) await wait(1_100);
+    if (contentSource === "raw" && i + 1 < selected.length) {
+      // 页请求保留短间隔；仅贴主仍是一层一请求，需使用更保守的节流。
+      await wait(rawPageMode ? 250 : 1_100);
+    }
   }
 
   if (!postBlocks.length) {
@@ -414,6 +455,9 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     postHeadingLevel: opts.postHeadingLevel,
     compactPostHeader: opts.compactPostHeader,
     contentSource,
+    exportedPostCount: rawPageMode
+      ? selected.reduce((total, page) => total + page.postCount, 0)
+      : postBlocks.length,
   });
 
   const title = topic.title || `topic-${topicId}`;
@@ -422,7 +466,9 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
   else if (opts.mode === "author") suffix = "-贴主";
   else if (opts.mode === "range") {
     const from = Number(opts.from) || 1;
-    const to = Number(opts.to) || selected[selected.length - 1]?.post_number || "";
+    const to = Number(opts.to) || (rawPageMode
+      ? selected[selected.length - 1]?.pageEnd || ""
+      : selected[selected.length - 1]?.post_number || "");
     suffix = `-${from}-${to}`;
   }
   const filename = `${topicId}-${safeFilename(title)}${suffix}.md`;
@@ -434,7 +480,9 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     filename,
     title,
     topicId,
-    postCount: postBlocks.length,
+    postCount: rawPageMode
+      ? selected.reduce((total, page) => total + page.postCount, 0)
+      : postBlocks.length,
     imageCount: imgCache.size,
     imageMode,
     webdavUploaded,
@@ -471,6 +519,7 @@ function buildMarkdown({
   postHeadingLevel = 4,
   compactPostHeader = false,
   contentSource = "html",
+  exportedPostCount = posts.length,
 }) {
   const title = topic.title || `Topic ${topicId}`;
   const url = `${origin}/t/topic/${topicId}`;
@@ -517,7 +566,7 @@ function buildMarkdown({
     bits.push(`**Topic ID**: ${topicId}`);
     bits.push(`**导出范围**: ${modeLabel}`);
     bits.push(`**正文来源**: ${contentSource === "raw" ? "Raw Markdown" : "HTML 转换"}`);
-    bits.push(`**导出楼层**: ${posts.length}`);
+    bits.push(`**导出楼层**: ${exportedPostCount}`);
     lines.push(bits.join("  \n"), "", "---", "");
   }
 

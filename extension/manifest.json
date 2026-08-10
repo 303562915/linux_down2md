@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "L站笔记导出 (Obsidian MD)",
-  "version": "1.6.9",
+  "version": "1.7.0",
   "description": "一键将 linux.do 主题导出为 Obsidian Markdown；支持 HTML 转换或论坛 Raw Markdown",
   "icons": {
     "16": "icons/icon16.png",
