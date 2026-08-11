@@ -86,6 +86,23 @@ function guessMime(url) {
   return null;
 }
 
+const FORUM_REQUEST_TIMEOUT_MS = 30_000;
+
+async function fetchWithTimeout(url, init = {}, timeoutMs = FORUM_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`请求超时（${Math.ceil(timeoutMs / 1000)} 秒）: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function downloadMarkdown(filename, content, { vaultPath = "", saveAs = false } = {}) {
   const bytes = new TextEncoder().encode(content);
   let binary = "";
@@ -143,7 +160,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "EXT_FETCH_JSON") {
     (async () => {
       try {
-        const res = await fetch(msg.url, {
+        const res = await fetchWithTimeout(msg.url, {
           credentials: "include",
           headers: {
             Accept: "application/json",
@@ -166,7 +183,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "EXT_FETCH_TEXT") {
     (async () => {
       try {
-        const res = await fetch(msg.url, {
+        const res = await fetchWithTimeout(msg.url, {
           credentials: "include",
           headers: { Accept: "text/plain, text/markdown;q=0.9, */*;q=0.8" },
         });
@@ -175,6 +192,35 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           throw new Error(`HTTP ${res.status}: ${msg.url}\n${body.slice(0, 200)}`);
         }
         sendResponse({ ok: true, data: await res.text() });
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message || String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "EXT_LOOKUP_UPLOAD_URLS") {
+    (async () => {
+      try {
+        const base = String(msg.origin || "").replace(/\/$/, "");
+        const shortUrls = Array.isArray(msg.shortUrls) ? msg.shortUrls.filter(Boolean) : [];
+        const body = new URLSearchParams();
+        for (const shortUrl of shortUrls) body.append("short_urls[]", shortUrl);
+        const res = await fetchWithTimeout(`${base}/uploads/lookup-urls`, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+          },
+          body,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(`HTTP ${res.status}: ${base}/uploads/lookup-urls\n${text.slice(0, 200)}`);
+        }
+        sendResponse({ ok: true, data: await res.json() });
       } catch (e) {
         sendResponse({ ok: false, error: e?.message || String(e) });
       }

@@ -82,24 +82,29 @@ export async function clearNoteDirectory() {
 }
 
 /**
- * 读取已保存的目录句柄，并确认仍有权限
+ * 读取已保存的目录句柄。初始化时只恢复句柄，不主动请求权限。
  * @returns {Promise<FileSystemDirectoryHandle|null>}
  */
 export async function getNoteDirectoryHandle() {
   try {
     const handle = await idbGet(KEY_NOTE_DIR);
     if (!handle) return null;
-    if (handle.queryPermission) {
-      let perm = await handle.queryPermission({ mode: "readwrite" });
-      if (perm !== "granted" && handle.requestPermission) {
-        perm = await handle.requestPermission({ mode: "readwrite" });
-      }
-      if (perm !== "granted") return null;
-    }
     return handle;
   } catch {
     return null;
   }
+}
+
+/** 在「导出」点击手势内恢复目录写入权限。 */
+export async function ensureNoteDirectoryPermission(handle) {
+  if (!handle) return false;
+  if (handle.requestPermission) {
+    return (await handle.requestPermission({ mode: "readwrite" })) === "granted";
+  }
+  if (handle.queryPermission) {
+    return (await handle.queryPermission({ mode: "readwrite" })) === "granted";
+  }
+  return true;
 }
 
 /**

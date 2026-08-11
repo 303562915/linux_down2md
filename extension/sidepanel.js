@@ -1,7 +1,9 @@
 import { parseTopicFromUrl } from "./lib/discourse.js";
 import { exportTopicMarkdown } from "./lib/export.js";
+import { lookupPageUploadUrls } from "./lib/page-upload-lookup.js";
 import {
   clearNoteDirectory,
+  ensureNoteDirectoryPermission,
   getNoteDirectoryHandle,
   pickNoteDirectory,
   supportsDirectoryPicker,
@@ -532,6 +534,7 @@ function bindUi() {
   document.querySelectorAll('input[name="contentSource"]').forEach((el) => {
     el.addEventListener("change", () => {
       updateContentSourceUi();
+      if (contentSourceValue() === "raw") detectPage().catch(() => {});
       saveSettings();
     });
   });
@@ -611,6 +614,15 @@ async function detectPage() {
   ui.btnExport.disabled = false;
   showError("");
 
+  // Raw 全量不需要主题 JSON；避免预览请求触发 Cloudflare 限流。
+  if (contentSourceValue() === "raw") {
+    ui.topicCard.hidden = false;
+    ui.topicTitle.textContent =
+      tab.title?.replace(/\s*[-–|]\s*LINUX DO.*$/i, "") || `Topic ${parsed.topicId}`;
+    ui.topicMeta.textContent = `ID ${parsed.topicId}`;
+    return;
+  }
+
   try {
     const info = await previewTopic(tab.url);
     ui.topicCard.hidden = false;
@@ -640,14 +652,19 @@ async function doExport() {
   showError("");
   setProgress(2, "开始导出…");
 
-  // 文件夹选择器必须在点击「导出」的用户手势内打开，不能等长耗时导出完成后再弹。
-  if (ui.enableNoteSync?.checked && !noteDirHandle && supportsDirectoryPicker()) {
+  // 权限恢复与目录选择都必须在点击「导出」的用户手势内进行。
+  if (ui.enableNoteSync?.checked && supportsDirectoryPicker()) {
     try {
-      const picked = await pickNoteDirectory();
-      noteDirHandle = picked.handle;
-      updateNoteFolderDisplay(picked.name);
-      await chrome.storage.local.set({ noteFolderName: picked.name, enableNoteSync: true });
-      updatePathPreview();
+      if (noteDirHandle) {
+        const granted = await ensureNoteDirectoryPermission(noteDirHandle);
+        if (!granted) throw new Error("未获得已选文件夹的写入权限");
+      } else {
+        const picked = await pickNoteDirectory();
+        noteDirHandle = picked.handle;
+        updateNoteFolderDisplay(picked.name);
+        await chrome.storage.local.set({ noteFolderName: picked.name, enableNoteSync: true });
+        updatePathPreview();
+      }
     } catch (e) {
       if (e?.name !== "AbortError") showError(e?.message || String(e));
       ui.progress.hidden = true;
@@ -675,6 +692,8 @@ async function doExport() {
   const options = {
     mode: modeValue(),
     contentSource: contentSourceValue(),
+    topicTitle: currentTab.title || "",
+    lookupRawUploads: (shortUrls) => lookupPageUploadUrls(currentTab.id, shortUrls),
     from: Number(ui.fromFloor.value) || 1,
     to: Number(ui.toFloor.value) || undefined,
     includeImages: imageMode !== "url",

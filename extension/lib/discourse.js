@@ -30,10 +30,41 @@ function canUseBackground() {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 30_000;
+const BACKGROUND_MESSAGE_TIMEOUT_MS = REQUEST_TIMEOUT_MS + 5_000;
+
 async function bgRequest(payload) {
-  const res = await chrome.runtime.sendMessage(payload);
-  if (!res?.ok) throw new Error(res?.error || "后台请求失败");
-  return res.data;
+  let timer;
+  try {
+    const res = await Promise.race([
+      chrome.runtime.sendMessage(payload),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`后台请求超时（${Math.ceil(BACKGROUND_MESSAGE_TIMEOUT_MS / 1000)} 秒）`)),
+          BACKGROUND_MESSAGE_TIMEOUT_MS
+        );
+      }),
+    ]);
+    if (!res?.ok) throw new Error(res?.error || "后台请求失败");
+    return res.data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithTimeout(url, init = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`请求超时（${Math.ceil(timeoutMs / 1000)} 秒）: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchJson(url) {
@@ -41,12 +72,12 @@ async function fetchJson(url) {
     try {
       return await bgRequest({ type: "EXT_FETCH_JSON", url });
     } catch (e) {
-      if (isHttpResponseError(e)) throw e;
+      if (isHttpResponseError(e) || isRequestTimeoutError(e)) throw e;
       // popup 里有时也可直接 fetch；后台失败再降级
       console.warn("[L2MD] bg json fail, fallback", e);
     }
   }
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     credentials: "include",
     headers: {
       Accept: "application/json",
@@ -69,6 +100,10 @@ function isTransientRequestError(error) {
 
 function isHttpResponseError(error) {
   return /^HTTP\s+\d{3}\b/i.test(String(error?.message || error || ""));
+}
+
+function isRequestTimeoutError(error) {
+  return /请求超时|后台请求超时/i.test(String(error?.message || error || ""));
 }
 
 async function retryRequest(request, onRetry = () => {}) {
@@ -103,11 +138,11 @@ async function fetchText(url) {
     try {
       return await bgRequest({ type: "EXT_FETCH_TEXT", url });
     } catch (e) {
-      if (isHttpResponseError(e)) throw e;
+      if (isHttpResponseError(e) || isRequestTimeoutError(e)) throw e;
       console.warn("[L2MD] bg text fail, fallback", e);
     }
   }
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     credentials: "include",
     headers: { Accept: "text/plain, text/markdown;q=0.9, */*;q=0.8" },
   });
@@ -139,6 +174,47 @@ export async function fetchRawTopicPage(origin, topicId, page, onRetry) {
   const topic = encodeURIComponent(String(topicId));
   const pageNumber = Math.max(1, Number(page) || 1);
   return fetchTextWithRetry(`${base}/raw/${topic}?page=${pageNumber}`, onRetry);
+}
+
+/**
+ * 批量把 Raw 中的 upload://短码解析为 Discourse 返回的真实上传 URL。
+ * 这通常是 CDN 直链，避免笔记应用再请求 linux.do 上传跳转页。
+ */
+export async function lookupUploadUrls(origin, shortUrls, onRetry = () => {}) {
+  const urls = [...new Set((shortUrls || []).map((url) => String(url || "").trim()).filter(Boolean))];
+  if (!urls.length) return [];
+  const base = origin.replace(/\/$/, "");
+
+  const request = async () => {
+    if (canUseBackground()) {
+      try {
+        return await bgRequest({ type: "EXT_LOOKUP_UPLOAD_URLS", origin: base, shortUrls: urls });
+      } catch (e) {
+        if (isHttpResponseError(e) || isRequestTimeoutError(e)) throw e;
+        console.warn("[L2MD] bg upload lookup fail, fallback", e);
+      }
+    }
+    const body = new URLSearchParams();
+    for (const shortUrl of urls) body.append("short_urls[]", shortUrl);
+    const res = await fetchWithTimeout(`${base}/uploads/lookup-urls`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`请求失败 ${res.status}: ${base}/uploads/lookup-urls\n${text.slice(0, 200)}`);
+    }
+    return res.json();
+  };
+
+  const data = await retryRequest(request, onRetry);
+  return Array.isArray(data) ? data : [];
 }
 
 /**

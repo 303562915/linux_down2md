@@ -6,6 +6,7 @@ import {
   fetchTopicSummary,
   imageUrlToDataUrl,
   imageUrlToBytes,
+  lookupUploadUrls,
   parseTopicFromUrl,
 } from "./discourse.js";
 import {
@@ -34,6 +35,8 @@ import {
  * @property {number} [contentHeadingOffset] 正文标题相对下沉级数，默认 3
  * @property {boolean} [compactPostHeader] 楼层用加粗而非标题（大纲更干净）
  * @property {'html'|'raw'} [contentSource] html=转换 cooked HTML，raw=直取 Discourse 原始 Markdown
+ * @property {string} [topicTitle] 当前标签页标题；Raw 全量模式用它避免额外主题 JSON 请求
+ * @property {(shortUrls: string[]) => Promise<Array<{short_url: string, url: string}>>} [lookupRawUploads]
  */
 
 const DEFAULT_OPTS = {
@@ -91,17 +94,25 @@ async function rewriteRawMarkdownImages(markdown, resolveImage) {
 }
 
 function absoluteRawUrl(url, origin) {
-  const value = String(url || "").trim();
-  if (value.startsWith("//")) return `https:${value}`;
+  const value = String(url || "").trim().replace(/^\/\//, "https://");
+  // Discourse Raw 用 upload:// 短码代替真实上传地址。短码由站点路由解析并重定向到 CDN，
+  // 不能从短码直接推算 /original/ 或 /optimized/ 的哈希文件名。
+  if (/^upload:\/\//i.test(value)) {
+    const shortUrl = value.slice("upload://".length);
+    return `${origin.replace(/\/$/, "")}/uploads/short-url/${shortUrl}`;
+  }
+  // Raw 中的相对上传路径实际位于 CDN；Obsidian 应直接请求该公开静态地址，
+  // 不要经 linux.do 上传路由，否则 Cloudflare 可能返回验证页。
+  if (/^\/(?:original|optimized)\//i.test(value)) return `https://cdn3.ldstatic.com${value}`;
   if (value.startsWith("/")) return `${origin}${value}`;
   return value;
 }
 
-function normalizeRawLinks(markdown, origin) {
+function normalizeRawLinks(markdown, origin, uploadUrls = new Map()) {
   return String(markdown || "").replace(
-    /(^|[^!])\[([^\]]+)\]\((\/\/[^\s)]+|\/[^\s)]+)(\s+[^)]*)?\)/gm,
+    /(^|[^!])\[([^\]]+)\]\((upload:\/\/[^\s)]+|\/\/[^\s)]+|\/[^\s)]+)(\s+[^)]*)?\)/gm,
     (_full, prefix, label, url, suffix = "") =>
-      `${prefix}[${label}](${absoluteRawUrl(url, origin)}${suffix})`
+      `${prefix}[${label}](${uploadUrls.get(url) || absoluteRawUrl(url, origin)}${suffix})`
   );
 }
 
@@ -126,7 +137,7 @@ function quoteHeader(attrs, origin) {
   return `**${author}**${source}`;
 }
 
-function normalizeRawDiscourseMarkup(markdown, origin) {
+function normalizeRawDiscourseMarkup(markdown, origin, uploadUrls) {
   let out = String(markdown || "");
   // 论坛 Raw 使用 BBCode 引用；转换为标准 Markdown，保留作者与原帖链接。
   out = out.replace(/\[quote="([^"]*)"\]\s*([\s\S]*?)\s*\[\/quote\]/gi, (_full, attrs, body) => {
@@ -140,7 +151,32 @@ function normalizeRawDiscourseMarkup(markdown, origin) {
     const folded = body.trim().split("\n").map((line) => (line ? `> ${line}` : ">"));
     return `> [!note]- ${title}\n${folded.join("\n")}`;
   });
-  return normalizeRawLinks(out, origin);
+  return normalizeRawLinks(out, origin, uploadUrls);
+}
+
+function rawUploadShortUrls(markdown) {
+  const shortUrls = new Set();
+  const re = /upload:\/\/([^\s)]+)/gi;
+  for (const match of String(markdown || "").matchAll(re)) shortUrls.add(match[1]);
+  return [...shortUrls];
+}
+
+function normalizeRawFloorHeaders(markdown, origin, headingLevel) {
+  let postCount = 0;
+  let highestPostNumber = 0;
+  const hashes = "#".repeat(Math.min(6, Math.max(1, Number(headingLevel) || 4)));
+  const content = String(markdown || "").replace(
+    /^([^|\n]+?)\s*\|\s*([^|\n]+?)\s*\|\s*#(\d+)\s*$/gm,
+    (_full, author, createdAt, number) => {
+      const name = author.trim();
+      const date = createdAt.trim();
+      const postNumber = Number(number) || 0;
+      postCount += 1;
+      highestPostNumber = Math.max(highestPostNumber, postNumber);
+      return `${hashes} [${name}](${origin}/u/${encodeURIComponent(name)}) · ${date} · #${number}`;
+    }
+  );
+  return { content, postCount, highestPostNumber };
 }
 
 function countRawMarkdownImages(markdown) {
@@ -149,46 +185,6 @@ function countRawMarkdownImages(markdown) {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function rawPageCandidates(topic, posts, mode, from, to, origin, topicId) {
-  const highest = Math.max(
-    Number(topic?.highest_post_number) || 0,
-    Number(topic?.posts_count) || 0,
-    1
-  );
-  // linux.do Raw 分页与主题默认分页一致：每页 20 层。
-  const pageSize = Number(topic?.chunk_size) || 20;
-  const start = mode === "op" ? 1 : mode === "range" ? Math.max(1, Number(from) || 1) : 1;
-  const end = mode === "op"
-    ? 1
-    : mode === "range"
-      ? Math.min(highest, Number(to) || highest)
-      : highest;
-  const firstPage = Math.floor((start - 1) / pageSize) + 1;
-  const lastPage = Math.floor((end - 1) / pageSize) + 1;
-  const pages = [];
-  for (let page = firstPage; page <= lastPage; page += 1) {
-    const pageStart = (page - 1) * pageSize + 1;
-    const pageEnd = Math.min(highest, page * pageSize);
-    const authors = (posts || [])
-      .filter((post) => post.post_number >= pageStart && post.post_number <= pageEnd)
-      .map((post) => ({
-        number: post.post_number,
-        name: post.name || post.username || "匿名",
-        url: post.username ? `${origin}/u/${encodeURIComponent(post.username)}` : "",
-      }));
-    pages.push({
-      page,
-      post_number: `第 ${page} 页（${pageStart}-${pageEnd} 楼）`,
-      pageStart,
-      pageEnd,
-      postCount: pageEnd - pageStart + 1,
-      authors,
-      pageUrl: `${origin}/t/topic/${topicId}/${pageStart}`,
-    });
-  }
-  return pages;
 }
 
 function rawPostCandidates(topic, mode, from, to) {
@@ -236,25 +232,27 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
   const { origin, topicId } = parsed;
   const rawPageMode = contentSource === "raw" && opts.mode === "all";
   const rawSummaryMode = contentSource === "raw" && opts.mode !== "author";
-  const rawAuthorProgress = (progress) => {
-    if (progress?.phase === "posts") {
-      onProgress({
-        ...progress,
-        message: `读取楼层作者索引 ${progress.done}/${progress.total}`,
-      });
-      return;
-    }
-    onProgress(progress);
-  };
-  // 分页 Raw 需读取楼层索引，才能把每页作者恢复为可点击的个人链接。
-  const fetched = rawPageMode || !rawSummaryMode
-    ? await fetchFullTopic(origin, topicId, rawPageMode ? rawAuthorProgress : onProgress)
-    : await fetchTopicSummary(origin, topicId, onProgress);
+  // Raw 全量只依赖 /raw/:topic?page=N；不要额外请求主题 JSON，避免其超时阻塞分页导出。
+  const fetched = rawPageMode
+    ? {
+        topic: {
+          title:
+            String(opts.topicTitle || "")
+              .replace(/\s*[-–|]\s*LINUX DO.*$/i, "")
+              .trim() || `topic-${topicId}`,
+        posts_count: 0,
+        highest_post_number: 0,
+      },
+        posts: [],
+      }
+    : rawSummaryMode
+      ? await fetchTopicSummary(origin, topicId, onProgress)
+      : await fetchFullTopic(origin, topicId, onProgress);
   const { topic, posts } = fetched;
 
   // 过滤楼层
   let selected = rawPageMode
-    ? rawPageCandidates(topic, posts, opts.mode, opts.from, opts.to, origin, topicId)
+    ? []
     : rawSummaryMode
       ? rawPostCandidates(topic, opts.mode, opts.from, opts.to)
       : posts;
@@ -283,12 +281,13 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     );
   }
 
-  if (!selected.length) {
+  if (!rawPageMode && !selected.length) {
     throw new Error("没有符合条件的楼层可导出");
   }
 
   // 图片缓存，避免重复下载
   const imgCache = new Map();
+  const rawUploadUrls = new Map();
   let imgDone = 0;
   let imgTotal = 0;
   let webdavUploaded = 0;
@@ -338,17 +337,18 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       return title || null;
     }
 
+    // Raw 的 /original/... 实际位于 CDN；其他相对路径仍使用论坛主域。
+    const sourceUrl = rawUploadUrls.get(src) || absoluteRawUrl(src, origin);
+
     if (imageMode === "url") {
-      if (src.startsWith("data:")) return null;
-      if (src.startsWith("//")) return "https:" + src;
-      if (src.startsWith("/")) return origin + src;
-      return src;
+      if (sourceUrl.startsWith("data:")) return null;
+      return sourceUrl;
     }
 
     // base64 模式：已是 data 直接返回
-    if (imageMode === "base64" && src.startsWith("data:")) return src;
+    if (imageMode === "base64" && sourceUrl.startsWith("data:")) return sourceUrl;
 
-    const key = `${imageMode}:${src}`;
+    const key = `${imageMode}:${sourceUrl}`;
     if (imgCache.has(key)) return imgCache.get(key);
 
     onProgress({
@@ -364,10 +364,10 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     try {
       let out;
       if (imageMode === "webdav") {
-        out = await uploadOneToWebdav(src, webdavCfg, origin, opts.maxImageBytes);
+        out = await uploadOneToWebdav(sourceUrl, webdavCfg, origin, opts.maxImageBytes);
         webdavUploaded += 1;
       } else {
-        out = await imageUrlToDataUrl(src, {
+        out = await imageUrlToDataUrl(sourceUrl, {
           maxBytes: opts.maxImageBytes,
           pageOrigin: origin,
         });
@@ -390,7 +390,7 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       // 失败回退：webdav 失败时尝试 base64；再失败用 URL
       try {
         if (imageMode === "webdav") {
-          const dataUrl = await imageUrlToDataUrl(src, {
+          const dataUrl = await imageUrlToDataUrl(sourceUrl, {
             maxBytes: opts.maxImageBytes,
             pageOrigin: origin,
           });
@@ -400,9 +400,7 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       } catch {
         /* ignore */
       }
-      let fallback = src;
-      if (fallback.startsWith("//")) fallback = "https:" + fallback;
-      if (fallback.startsWith("/")) fallback = origin + fallback;
+      let fallback = sourceUrl;
       if (fallback.startsWith("data:")) fallback = null;
       imgCache.set(key, fallback);
       return fallback;
@@ -424,6 +422,132 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     return buildImageMarkdownSrc(cfg, remoteFile, filename);
   }
 
+  if (rawPageMode) {
+    const rawPages = [];
+    const seenPages = new Set();
+    let rawPostCount = 0;
+    const highestPostNumber = Math.max(
+      Number(topic?.highest_post_number) || 0,
+      Number(topic?.posts_count) || 0
+    );
+    const maxPages = 50;
+
+    for (let page = 1; page <= maxPages; page += 1) {
+      onProgress({
+        phase: "convert",
+        done: page - 1,
+        total: 0,
+        message: `读取 Raw 第 ${page} 页…`,
+      });
+
+      let raw;
+      try {
+        raw = await fetchRawTopicPage(origin, topicId, page, ({ attempt, delayMs }) => {
+          onProgress({
+            phase: "convert",
+            done: page - 1,
+            total: 0,
+            message: `Raw 第 ${page} 页请求过快，${Math.ceil(delayMs / 1000)} 秒后重试（第 ${attempt} 次）…`,
+          });
+        });
+      } catch (error) {
+        if (page > 1 && isNotFoundError(error)) break;
+        throw error;
+      }
+
+      const rawKey = String(raw || "").trim();
+      if (!rawKey || seenPages.has(rawKey)) break;
+      seenPages.add(rawKey);
+
+      const floorResult = normalizeRawFloorHeaders(
+        rawKey,
+        origin,
+        opts.postHeadingLevel
+      );
+      // 末页通常会是空内容；部分站点配置会返回非空的提示文本。
+      // 这种响应没有楼层标题，不能把它写进导出的正文。
+      if (page > 1 && !floorResult.postCount) break;
+      rawPages.push(floorResult.content);
+      rawPostCount += floorResult.postCount;
+
+      // 主题摘要已给出最大楼层号，读到它即可结束，无需再试探后续页。
+      if (
+        highestPostNumber &&
+        floorResult.highestPostNumber >= highestPostNumber
+      ) {
+        break;
+      }
+
+      if (page < maxPages) await wait(250);
+    }
+
+    if (!rawPages.length) throw new Error("没有可读取的 Raw 页面");
+
+    // Raw 页中可能有多个 upload:// 短码，一次解析完，避免按图片或按楼层请求。
+    const shortUrls = rawUploadShortUrls(rawPages.join("\n"));
+    if (shortUrls.length) {
+      try {
+        const resolveUploads = typeof opts.lookupRawUploads === "function"
+          ? opts.lookupRawUploads
+          : (urls) => lookupUploadUrls(origin, urls, ({ attempt, delayMs }) => {
+              onProgress({
+                phase: "convert",
+                done: rawPages.length,
+                total: rawPages.length,
+                message: `解析图片短链请求过快，${Math.ceil(delayMs / 1000)} 秒后重试（第 ${attempt} 次）…`,
+              });
+            });
+        const resolvedUploads = await resolveUploads(shortUrls);
+        for (const item of resolvedUploads) {
+          const shortUrl = String(item?.short_url || "").trim();
+          const url = String(item?.url || "").trim();
+          if (shortUrl && url) rawUploadUrls.set(`upload://${shortUrl}`, url);
+        }
+      } catch (error) {
+        // 正文导出可继续；未解析的短码仍保留论坛可点击地址。
+        console.warn("[L2MD] upload short-url lookup failed", error);
+      }
+    }
+
+    const contentPages = [];
+    for (const rawPage of rawPages) {
+      let contentMd = normalizeRawDiscourseMarkup(rawPage, origin, rawUploadUrls);
+      if (imageMode !== "url") imgTotal += countRawMarkdownImages(contentMd);
+      contentMd = await rewriteRawMarkdownImages(contentMd, resolveImage);
+      contentPages.push(contentMd.trim());
+    }
+
+    const exportedPostCount = rawPostCount || Number(topic.posts_count) || 0;
+    const md = buildMarkdown({
+      topic,
+      origin,
+      topicId,
+      posts: [{ contentMd: contentPages.join("\n\n"), hideHeader: true }],
+      includeMeta: opts.includeMeta,
+      mode: opts.mode,
+      postHeadingLevel: opts.postHeadingLevel,
+      compactPostHeader: opts.compactPostHeader,
+      contentSource,
+      exportedPostCount,
+    });
+    const title = topic.title || `topic-${topicId}`;
+    const filename = `${topicId}-${safeFilename(title)}.md`;
+    onProgress({ phase: "done", done: 1, total: 1, message: "完成" });
+    return {
+      markdown: md,
+      filename,
+      title,
+      topicId,
+      postCount: exportedPostCount,
+      imageCount: imgCache.size,
+      imageMode,
+      webdavUploaded,
+      mode: opts.mode,
+      authorUsername,
+      contentSource,
+    };
+  }
+
   onProgress({
     phase: "convert",
     done: 0,
@@ -437,16 +561,7 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
     let contentMd;
     if (contentSource === "raw") {
       try {
-        const fetchRaw = rawPageMode
-          ? fetchRawTopicPage(origin, topicId, p.page, ({ attempt, delayMs }) => {
-              onProgress({
-                phase: "convert",
-                done: i,
-                total: selected.length,
-                message: `Raw 第 ${p.page} 页请求过快，${Math.ceil(delayMs / 1000)} 秒后重试（第 ${attempt} 次）…`,
-              });
-            })
-          : fetchRawPost(origin, topicId, p.post_number, ({ attempt, delayMs }) => {
+        const fetchRaw = fetchRawPost(origin, topicId, p.post_number, ({ attempt, delayMs }) => {
           onProgress({
             phase: "convert",
             done: i,
@@ -492,8 +607,6 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       replyTo: !rawSummaryMode && p.reply_to_user
         ? `回复 @${p.reply_to_user.username || p.reply_to_user}`
         : "",
-      authors: rawPageMode ? p.authors || [] : [],
-      pageUrl: rawPageMode ? p.pageUrl || "" : "",
       contentMd,
     });
 
@@ -503,15 +616,12 @@ export async function exportTopicMarkdown(pageUrl, options = {}, onProgress = ()
       total: selected.length,
       message:
         contentSource === "raw"
-          ? rawPageMode
-            ? `读取 Raw 第 ${i + 1}/${selected.length} 页`
-            : `读取原文 ${i + 1}/${selected.length}`
+          ? `读取原文 ${i + 1}/${selected.length}`
           : `转换楼层 ${i + 1}/${selected.length}`,
     });
 
     if (contentSource === "raw" && i + 1 < selected.length) {
-      // 页请求保留短间隔；仅贴主仍是一层一请求，需使用更保守的节流。
-      await wait(rawPageMode ? 250 : 1_100);
+      await wait(1_100);
     }
   }
 
@@ -646,6 +756,10 @@ function buildMarkdown({
   }
 
   for (const p of posts) {
+    if (p.hideHeader) {
+      if (p.contentMd) lines.push(p.contentMd, "");
+      continue;
+    }
     // 不要写成 #### #1，否则 Obsidian 会显示多余的 #；楼层号用纯数字
     const label = `${p.number} ${p.author}${p.createdAt ? ` · ${p.createdAt}` : ""}`.trim();
     // Obsidian：默认 #### 楼层；紧凑模式用加粗，不占大纲
@@ -659,13 +773,6 @@ function buildMarkdown({
     }
     if (p.pageUrl) {
       lines.push(`*论坛页*: [打开此页](${p.pageUrl})`, "");
-    }
-    if (p.authors?.length) {
-      const authorLinks = p.authors.map((author) => {
-        const label = `${author.number} · ${author.name}`;
-        return author.url ? `[${label}](${author.url})` : label;
-      });
-      lines.push(`*楼层作者*: ${authorLinks.join(" · ")}`, "");
     }
     if (p.replyTo) {
       lines.push(`> ${p.replyTo}`, "");

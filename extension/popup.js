@@ -1,5 +1,6 @@
 import { parseTopicFromUrl } from "./lib/discourse.js";
 import { exportTopicMarkdown } from "./lib/export.js";
+import { lookupPageUploadUrls } from "./lib/page-upload-lookup.js";
 import {
   ensureDir,
   joinRemotePath,
@@ -407,6 +408,7 @@ function bindUi() {
   document.querySelectorAll('input[name="contentSource"]').forEach((el) => {
     el.addEventListener("change", () => {
       updateContentSourceUi();
+      if (contentSourceValue() === "raw") detectPage().catch(() => {});
       saveSettings();
     });
   });
@@ -495,6 +497,14 @@ async function detectPage() {
   ui.btnExport.disabled = false;
   showError("");
 
+  if (contentSourceValue() === "raw") {
+    ui.topicCard.hidden = false;
+    ui.topicTitle.textContent =
+      tab.title?.replace(/\s*[-–|]\s*LINUX DO.*$/i, "") || `Topic ${parsed.topicId}`;
+    ui.topicMeta.textContent = `ID ${parsed.topicId}`;
+    return;
+  }
+
   try {
     const info = await previewTopic(tab.url);
     ui.topicCard.hidden = false;
@@ -542,6 +552,8 @@ async function doExport() {
   const options = {
     mode: modeValue(),
     contentSource: contentSourceValue(),
+    topicTitle: currentTab.title || "",
+    lookupRawUploads: (shortUrls) => lookupPageUploadUrls(currentTab.id, shortUrls),
     from: Number(ui.fromFloor.value) || 1,
     to: Number(ui.toFloor.value) || undefined,
     includeImages: imageMode !== "url",
